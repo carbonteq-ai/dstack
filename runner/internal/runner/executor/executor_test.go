@@ -101,6 +101,51 @@ func TestStopImmediately(t *testing.T) {
 	assert.False(t, stopImmediately(nil))
 }
 
+// Cancellation must reach the workload, not just the shell that launched it.
+// Tasks run through an interactive shell (JobConfigurator._commands builds
+// `/bin/sh -i -c "<commands>"`) and startCommand() starts that shell as a
+// session leader with a controlling pty. The shell therefore enables job
+// control and runs the workload in a separate foreground process group, so
+// signalling the shell's pid alone never interrupts the workload.
+func TestExecutor_CancelReachesJobUnderInteractiveShell(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	ex := makeTestExecutor(t)
+	stopDuration := uint(10)
+	ex.jobSpec.StopDuration = &stopDuration
+	ex.killDelay = 10 * time.Second
+
+	marker := filepath.Join(t.TempDir(), "interrupted")
+	// Outer interactive shell, inner workload that records its own interrupt.
+	ex.jobSpec.Commands = []string{
+		"/bin/sh", "-i", "-c",
+		fmt.Sprintf(
+			"/bin/sh -c 'trap \"echo interrupted >%s; exit 130\" INT; echo ready; while :; do sleep 0.1; done'",
+			marker,
+		),
+	}
+	makeCodeTar(t, ex)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		time.Sleep(3 * time.Second)
+		cancel()
+	}()
+	_ = ex.Run(ctx)
+
+	// The workload writes the marker from its INT trap; poll briefly so the
+	// assertion does not race the shell teardown.
+	for range 50 {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	assert.FileExists(t, marker, "cancellation must interrupt the workload under the shell")
+}
+
 func TestExecutor_NonZeroExit(t *testing.T) {
 	ex := makeTestExecutor(t)
 	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "exit 100")
@@ -172,7 +217,15 @@ func TestExecutor_MaxDuration(t *testing.T) {
 	makeCodeTar(t, ex)
 
 	err := ex.Run(t.Context())
-	assert.ErrorContains(t, err, "killed")
+
+	// Assert the contract (the job is terminated for exceeding its max
+	// duration) rather than the signal that achieved it. Cancellation is now
+	// delivered to the job's process group, so the workload observes the
+	// interrupt and exits instead of surviving until the hard kill.
+	assert.ErrorContains(t, err, "max duration exceeded")
+	history := ex.GetHistory(0)
+	lastState := history.JobStates[len(history.JobStates)-1]
+	assert.Equal(t, schemas.JobStateTerminated, lastState.State)
 }
 
 func TestExecutor_LogQuota(t *testing.T) {

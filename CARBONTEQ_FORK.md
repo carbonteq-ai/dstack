@@ -49,6 +49,54 @@ The maintained behavior is finite and zero stop duration for task workloads.
 Unbounded `off` is intentionally unsupported until the terminating pipeline
 can continue polling runner state without repeatedly initiating termination.
 
+### Deliver cancellation to the job's process group
+
+A bounded stop duration is useless if the workload never learns it should stop.
+Upstream signals only `cmd.Process`, which is the shell that
+`JobConfigurator._commands` builds (`/bin/sh -i -c "<commands>"`), and
+`startCommand()` starts that shell as a session leader with the pty as its
+controlling terminal. The shell therefore enables job control, places the
+workload in its own process group, and makes that group the terminal's
+foreground group. An interactive shell neither dies on nor forwards the
+interrupt, so the workload never observed cancellation: it kept running for the
+whole grace period and was then destroyed by the container hard kill, losing any
+chance to finalize its own evidence.
+
+Measured on a pty reproduction of the runner topology: with the workload under
+`/bin/sh -i -c`, the shell's process group and the terminal's foreground
+process group are different, signalling the shell's pid leaves the workload
+running, and signalling the foreground group interrupts it and then lets the
+shell exit normally.
+
+The candidate delta in `runner/internal/runner/executor/executor.go`:
+
+- publishes the job pty so cancellation can resolve the terminal's foreground
+  process group through `TIOCGPGRP`;
+- delivers the graceful interrupt to that process group, falling back to the
+  command's own process group and finally to the command itself;
+- deliberately leaves the shell unsignalled on the graceful path so it stays
+  alive to wait for the workload, because killing it would let the runner treat
+  the command as finished while the workload is still shutting down, truncating
+  the stop duration; and
+- kills both the workload group and the command on the zero stop-duration path,
+  where no orderly shutdown is expected.
+
+Regression coverage is
+`TestExecutor_CancelReachesJobUnderInteractiveShell` in
+`runner/internal/runner/executor/executor_test.go`, which reproduces the
+production interactive-shell entrypoint and asserts that the workload runs its
+own interrupt trap.
+
+`TestExecutor_MaxDuration` previously asserted the error text `killed`. That
+encoded the defect: the workload ignored the graceful signal and survived until
+the hard kill. It now asserts the actual contract, that the job is terminated
+for exceeding its max duration.
+
+Known bound: after `WaitDelay` elapses Go kills only the command, so a workload
+that ignores the interrupt for the entire stop duration can outlive the runner's
+own kill until the shim's container stop removes it. That is acceptable because
+both deadlines derive from the same stop duration.
+
 ## Compatibility and release
 
 Build the server, runner, and shim from the same fork commit and give the
