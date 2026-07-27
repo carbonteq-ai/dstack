@@ -67,6 +67,40 @@ func TestExecutor_HomeDir(t *testing.T) {
 	assert.Equal(t, ex.currentUser.HomeDir+"\n", strings.ReplaceAll(b.String(), "\r\n", "\n"))
 }
 
+func TestExecutor_SetJobUsesStopDuration(t *testing.T) {
+	ex := makeTestExecutor(t)
+	stopDuration := uint(37)
+
+	ex.SetJob(schemas.SubmitBody{
+		JobSpec: schemas.JobSpec{
+			StopDuration: &stopDuration,
+		},
+	})
+
+	assert.Equal(t, 37*time.Second, ex.killDelay)
+}
+
+func TestExecutor_SetJobLeavesStopDurationOffUnbounded(t *testing.T) {
+	ex := makeTestExecutor(t)
+
+	ex.SetJob(schemas.SubmitBody{
+		JobSpec: schemas.JobSpec{
+			StopDuration: nil,
+		},
+	})
+
+	assert.Zero(t, ex.killDelay)
+}
+
+func TestStopImmediately(t *testing.T) {
+	zero := uint(0)
+	bounded := uint(37)
+
+	assert.True(t, stopImmediately(&zero))
+	assert.False(t, stopImmediately(&bounded))
+	assert.False(t, stopImmediately(nil))
+}
+
 func TestExecutor_NonZeroExit(t *testing.T) {
 	ex := makeTestExecutor(t)
 	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "exit 100")

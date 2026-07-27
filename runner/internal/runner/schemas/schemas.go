@@ -80,6 +80,7 @@ type JobSpec struct {
 	Env            map[string]string `json:"env"`
 	SingleBranch   bool              `json:"single_branch"`
 	MaxDuration    int               `json:"max_duration"`
+	StopDuration   *uint             `json:"stop_duration"`
 	SSHKey         *SSHKey           `json:"ssh_key"`
 	WorkingDir     *string           `json:"working_dir"`
 	RepoDir        *string           `json:"repo_dir"`

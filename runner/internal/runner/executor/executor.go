@@ -120,7 +120,6 @@ func NewRunExecutor(tempDir string, dstackDir string, currentUser linuxuser.User
 		runnerLogs:      newAppendWriter(mu, timestamp),
 		timestamp:       timestamp,
 
-		killDelay:         10 * time.Second,
 		connectionTracker: connectionTracker,
 	}, nil
 }
@@ -275,10 +274,18 @@ func (ex *RunExecutor) SetJob(body schemas.SubmitBody) {
 	ex.run = body.Run
 	ex.jobSubmission = body.JobSubmission
 	ex.jobSpec = body.JobSpec
+	ex.killDelay = 0
+	if body.JobSpec.StopDuration != nil {
+		ex.killDelay = time.Duration(*body.JobSpec.StopDuration) * time.Second
+	}
 	ex.clusterInfo = body.ClusterInfo
 	ex.secrets = body.Secrets
 	ex.repoCredentials = body.RepoCredentials
 	ex.jobLogs.SetQuota(body.LogQuotaHour)
+}
+
+func stopImmediately(stopDuration *uint) bool {
+	return stopDuration != nil && *stopDuration == 0
 }
 
 func (ex *RunExecutor) SetJobState(ctx context.Context, state schemas.JobState) {
@@ -495,6 +502,12 @@ func (ex *RunExecutor) execJob(ctx context.Context, jobLogFile io.Writer) error 
 
 	cmd := exec.CommandContext(ctx, ex.jobSpec.Commands[0], ex.jobSpec.Commands[1:]...)
 	cmd.Cancel = func() error {
+		if stopImmediately(ex.jobSpec.StopDuration) {
+			if killErr := cmd.Process.Kill(); killErr != nil {
+				return fmt.Errorf("kill process: %w", killErr)
+			}
+			return nil
+		}
 		// returns error on Windows
 		if signalErr := cmd.Process.Signal(os.Interrupt); signalErr != nil {
 			return fmt.Errorf("send interrupt signal: %w", signalErr)

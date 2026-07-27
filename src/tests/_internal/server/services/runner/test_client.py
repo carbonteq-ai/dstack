@@ -74,6 +74,34 @@ class BaseShimClientTest:
 
 
 class TestRunnerClientSubmitJob(BaseShimClientTest):
+    def test_forwards_stop_duration(self, adapter: requests_mock.Adapter):
+        adapter.register_uri("POST", "/api/submit", json={})
+        run_spec = get_run_spec(
+            repo_id="repo", configuration=TaskConfiguration(commands=["true"], dstack=True)
+        )
+        run = Run.construct(id=uuid.uuid4(), project_name="main", run_spec=run_spec)
+        job = Job.construct(
+            job_spec=JobSpec.construct(env={}, stop_duration=37),
+            job_submissions=[
+                JobSubmission.construct(
+                    id=uuid.uuid4(),
+                    submitted_at=datetime.now(timezone.utc),
+                )
+            ],
+        )
+        client = RunnerClient(port=DSTACK_RUNNER_HTTP_PORT)
+
+        client.submit_job(
+            run=run,
+            job=job,
+            cluster_info=ClusterInfo(job_ips=[], master_job_ip="", gpus_per_job=0),
+            secrets={},
+            repo_credentials=None,
+        )
+
+        assert adapter.last_request is not None
+        assert adapter.last_request.json()["job_spec"]["stop_duration"] == 37
+
     def test_adds_default_project_for_server_access(self, adapter: requests_mock.Adapter):
         adapter.register_uri("POST", "/api/submit", json={})
         run_spec = get_run_spec(

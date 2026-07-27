@@ -3,11 +3,46 @@ from unittest.mock import patch
 
 import pytest
 
+from dstack._internal.core.errors import ServerClientError
 from dstack._internal.core.models.configurations import TaskConfiguration
+from dstack._internal.core.models.profiles import Profile
 from dstack._internal.core.models.runs import JobSSHKey
 from dstack._internal.server.services.docker import ImageConfig
 from dstack._internal.server.services.jobs.configurators.task import TaskJobConfigurator
 from dstack._internal.server.testing.common import get_run_spec
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("image_config_mock")
+class TestStopDuration:
+    @pytest.mark.parametrize("stop_duration", [0, 37])
+    async def test_accepts_bounded_duration(self, stop_duration: int):
+        configuration = TaskConfiguration(image="debian", commands=["true"])
+        run_spec = get_run_spec(
+            run_name="run",
+            repo_id="id",
+            configuration=configuration,
+            profile=Profile(name="bounded-stop", stop_duration=stop_duration),
+        )
+
+        job_specs = await TaskJobConfigurator(run_spec).get_job_specs(replica_num=0)
+
+        assert job_specs[0].stop_duration == stop_duration
+
+    async def test_rejects_off(self):
+        configuration = TaskConfiguration(image="debian", commands=["true"])
+        run_spec = get_run_spec(
+            run_name="run",
+            repo_id="id",
+            configuration=configuration,
+            profile=Profile(name="unbounded-stop", stop_duration="off"),
+        )
+
+        with pytest.raises(
+            ServerClientError,
+            match="Dockerized tasks require a bounded stop_duration",
+        ):
+            await TaskJobConfigurator(run_spec).get_job_specs(replica_num=0)
 
 
 @pytest.mark.asyncio
