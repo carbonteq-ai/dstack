@@ -2,11 +2,12 @@
 
 ## Status
 
-Candidate and unpublished. The working tree is based on upstream dstack
+Published candidate branch. The working tree is based on upstream dstack
 `0.20.29` at commit `2f9618f4d521140350efd1b344412d122c1e0322`.
-`origin` still points to `dstackai/dstack`; a CarbonTeq `origin` and upstream
-remote must be configured before publication. No consumer may select this
-checkout until the delta is committed, pushed, and recorded by full SHA.
+`origin` points to `carbonteq-ai/dstack` and `upstream` points to
+`dstackai/dstack`. Consumers may pin only the published CarbonTeq branch head
+by full SHA; deployment remains blocked until one matching server/runner/shim
+release is built and qualified.
 
 ## Maintained delta
 
@@ -88,4 +89,5 @@ cancellation gate. Retire the fork only after an upstream release propagates
 the same bounded value through both server and runner and passes the CarbonTeq
 qualification unchanged.
 
-Published fork commit: not yet available.
+Published fork commit: branch `codex/graceful-cancellation-stop-duration`
+(record the exact head SHA in the consumer repository after publication).
