@@ -9,10 +9,12 @@ Published candidate branch. The working tree is based on upstream dstack
 by full SHA; deployment remains blocked until one matching server/runner/shim
 release is built and qualified.
 
-The active `codex/registry-default-auth` working branch adds the exact-host
-registry credential and live RunPod GPU-offer behavior below on top of published commit
-`275b81bc725967c8925b5b12d96500dc60a45370`. It is not a reproducible consumer
-selection until committed and pushed.
+Published branch `codex/registry-default-auth` adds the exact-host registry
+credential and live RunPod GPU-offer behavior below on top of commit
+`275b81bc725967c8925b5b12d96500dc60a45370`. Its published head is
+`d2586c3871525e461bcbc442deaa511af2a87758`. Production still selects the
+preceding release because its two-worker promotion gate is not currently
+satisfied; the candidate itself has been packaged and qualified in isolation.
 
 ## Maintained delta
 
@@ -169,9 +171,9 @@ Ruff check and format check passed
 git diff --check passed
 ```
 
-The unpublished exact-host credential delta additionally passes 38 focused
+The published exact-host credential delta additionally passes 38 focused
 Docker-default and job-service tests plus Ruff and `git diff --check`.
-The unpublished RunPod live-offer delta passes all seven RunPod backend tests,
+The published RunPod live-offer delta passes all seven RunPod backend tests,
 including its three new compute tests, plus Ruff and `git diff --check`.
 Resolving a fresh unpinned dev environment and running the two broader
 submitted/running pipeline files produced 106 passes, 110 PostgreSQL skips,
@@ -194,6 +196,11 @@ cancellation gate. Retire the fork only after an upstream release propagates
 the same bounded value through both server and runner and passes the CarbonTeq
 qualification unchanged.
 
-Published fork commit: `275b81bc725967c8925b5b12d96500dc60a45370` on branch
-`codex/graceful-cancellation-stop-duration`. The exact-host credential branch
-has no published commit yet.
+The packaged `d2586c3871525e461bcbc442deaa511af2a87758` candidate additionally
+passed a real RunPod Secure Cloud spot canary on an RTX PRO 6000 Blackwell
+Server Edition. dstack observed submission through `done`, CUDA reported
+97,887 MiB visible VRAM, and fleet deletion left the RunPod account with zero
+active Pods.
+
+Published fork commit: `d2586c3871525e461bcbc442deaa511af2a87758` on branch
+`codex/registry-default-auth`.
