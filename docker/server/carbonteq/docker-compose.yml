@@ -1,0 +1,110 @@
+# Dokploy "Compose" stack for the CarbonTeq dstack fork.
+#
+# Everything is built from this repo, because the fork delta lives in both the
+# Python server AND the Go runner/shim binaries. Deploying only the server would
+# leave workers on upstream binaries and the bounded stop_duration would not
+# take effect.
+
+name: dstack-cp
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DSTACK_POSTGRES_USER:-dstack}
+      POSTGRES_PASSWORD: ${DSTACK_POSTGRES_PASSWORD:?set a password}
+      POSTGRES_DB: ${DSTACK_POSTGRES_DB:-dstack}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Hosts the fork's runner/shim binaries. Must be reachable from the worker
+  # machines, so give this service its own Dokploy domain and use that domain in
+  # DSTACK_RUNNER_DOWNLOAD_URL / DSTACK_SHIM_DOWNLOAD_URL.
+  binaries:
+    build:
+      context: ../../..
+      dockerfile: docker/server/carbonteq/Dockerfile.binaries
+      args:
+        VERSION: ${DSTACK_COMPONENT_VERSION:?set the fork component version}
+    restart: unless-stopped
+    expose:
+      - "80"
+
+  server:
+    build:
+      context: ../../..
+      dockerfile: docker/server/carbonteq/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DSTACK_DATABASE_URL: postgresql+asyncpg://${DSTACK_POSTGRES_USER:-dstack}:${DSTACK_POSTGRES_PASSWORD}@postgres:5432/${DSTACK_POSTGRES_DB:-dstack}
+      DSTACK_SERVER_ADMIN_TOKEN: ${DSTACK_SERVER_ADMIN_TOKEN:?set an admin token}
+      DSTACK_SERVER_URL: ${DSTACK_SERVER_URL:?set the public server URL}
+      DSTACK_SERVER_LOG_FORMAT: json
+      DSTACK_SERVER_LOG_LEVEL: INFO
+      # Source builds leave version.py at 0.0.0, so DSTACK_VERSION resolves to
+      # None and the CLI turns on uvicorn autoreload. Off, explicitly.
+      DSTACK_SERVER_RELOAD_DISABLED: "1"
+
+      # Fork rollout. Both the version and the download URL are required:
+      # the server only installs a component when it knows an expected version
+      # and that version differs from what the worker reports.
+      #
+      # Do NOT set DSTACK_VERSION to the fork version. It is parsed as PEP 440
+      # and a value like "0.20.29-ct1" raises ValueError at import. These two
+      # vars are read as raw strings, so any label is safe here.
+      DSTACK_RUNNER_VERSION: ${DSTACK_COMPONENT_VERSION}
+      DSTACK_SHIM_VERSION: ${DSTACK_COMPONENT_VERSION}
+      DSTACK_RUNNER_DOWNLOAD_URL: ${DSTACK_BINARIES_URL}/{version}/binaries/dstack-runner-linux-{arch}
+      DSTACK_SHIM_DOWNLOAD_URL: ${DSTACK_BINARIES_URL}/{version}/binaries/dstack-shim-linux-{arch}
+
+      DSTACK_SSHPROXY_API_TOKEN: ${DSTACK_SSHPROXY_API_TOKEN:?set a proxy token}
+      DSTACK_SERVER_SSHPROXY_ADDRESS: ${DSTACK_SERVER_SSHPROXY_ADDRESS:?set host:30022}
+    volumes:
+      # config.yml (backend credentials) + run logs. Postgres holds the rest.
+      - server-data:/root/.dstack/server
+    expose:
+      - "3000"
+
+  sshproxy-keygen:
+    image: alpine:3
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache openssh-keygen >/dev/null
+        [ -f /keys/host_key ] || ssh-keygen -t ed25519 -f /keys/host_key -N "" -C dstack-sshproxy
+    volumes:
+      - sshproxy-keys:/keys
+
+  sshproxy:
+    image: dstackai/sshproxy:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      sshproxy-keygen:
+        condition: service_completed_successfully
+      server:
+        condition: service_started
+    environment:
+      DSTACK_SSHPROXY_API_URL: http://server:3000
+      DSTACK_SSHPROXY_API_TOKEN: ${DSTACK_SSHPROXY_API_TOKEN}
+    command: ["--host-key", "/keys/host_key"]
+    volumes:
+      - sshproxy-keys:/keys
+    # Raw TCP: Traefik's HTTP routers cannot carry this, it needs a host port.
+    ports:
+      - "30022:30022"
+
+volumes:
+  postgres-data:
+  server-data:
+  sshproxy-keys:

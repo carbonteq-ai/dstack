@@ -1,0 +1,30 @@
+# Serves the fork's dstack-runner / dstack-shim binaries over HTTP so the server
+# can install them onto SSH-fleet workers via DSTACK_RUNNER_DOWNLOAD_URL and
+# DSTACK_SHIM_DOWNLOAD_URL.
+#
+# Layout produced (matching the {version}/{arch} download-URL templates):
+#   /<VERSION>/binaries/dstack-runner-linux-amd64
+#   /<VERSION>/binaries/dstack-shim-linux-amd64
+
+ARG VERSION=0.20.29-ct1
+
+FROM golang:1.25-bookworm AS build
+ARG VERSION
+ARG TARGETARCH=amd64
+WORKDIR /src
+COPY runner/go.mod runner/go.sum ./runner/
+WORKDIR /src/runner
+RUN go mod download
+COPY runner/ ./
+# The shim needs cgo; the runner is built fully static so it drops onto any worker.
+RUN GOOS=linux GOARCH=${TARGETARCH} CGO_ENABLED=0 \
+        go build -ldflags "-X 'main.Version=${VERSION}' -extldflags '-static'" \
+        -o /out/dstack-runner-linux-${TARGETARCH} github.com/dstackai/dstack/runner/cmd/runner \
+ && GOOS=linux GOARCH=${TARGETARCH} CGO_ENABLED=1 \
+        go build -ldflags "-X 'main.Version=${VERSION}'" \
+        -o /out/dstack-shim-linux-${TARGETARCH} github.com/dstackai/dstack/runner/cmd/shim
+
+FROM nginx:alpine
+ARG VERSION
+COPY --from=build /out/ /usr/share/nginx/html/${VERSION}/binaries/
+RUN chmod -R a+rX /usr/share/nginx/html
