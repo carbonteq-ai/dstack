@@ -1,44 +1,46 @@
-# CarbonTeq dstack server, built from this fork's source.
+# CarbonTeq dstack server.
 #
-# The upstream docker/server/release/Dockerfile installs `dstack` from PyPI by
-# version and therefore does NOT contain the fork delta. This one builds the
-# server (and the web UI) from the working tree.
+# Follows the production pattern from ai-infra: start from the digest-pinned
+# upstream image and replace ONLY the project wheel. The dependency graph then
+# comes from upstream's immutable, already-qualified image rather than being
+# re-resolved on every build.
+#
+# Differs from production in one way: the upstream web UI is preserved across
+# the wheel swap. A source-built wheel contains no statics, so a plain
+# --reinstall would uninstall upstream's and leave the server with no dashboard.
+# The fork changes no frontend code, so upstream's UI is correct here.
 
-FROM node:18-slim AS frontend
-WORKDIR /frontend
-COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
-COPY frontend/ ./
-RUN npm run build
+ARG BASE_IMAGE=dstackai/dstack:0.20.29@sha256:6d57647be04cad42dff2343f4f50d41a3b8bb438ebc67165bc56aa92858e69ce
 
-FROM python:3.11-slim
-
-ENV PYTHONUNBUFFERED=1
-ENV DSTACK_SERVER_LOG_FORMAT=json
-
-WORKDIR /dstack-server
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
-        git \
-        openssh-client \
-        sqlite3 \
-        tini \
-    && rm -rf /var/lib/apt/lists/*
-
-ADD https://astral.sh/uv/install.sh /uv-installer.sh
-RUN sh /uv-installer.sh && rm /uv-installer.sh
-ENV PATH="/root/.local/bin/:$PATH"
-
+FROM ${BASE_IMAGE} AS build
+WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY src src
 COPY skills skills
-# hatchling ships src/dstack/_internal/server/statics/** as a wheel artifact,
-# so dropping the built UI here is enough to get it into the install.
-COPY --from=frontend /frontend/build src/dstack/_internal/server/statics
+RUN /root/.local/bin/uv build --wheel -o /dist .
 
-RUN uv pip install --system ".[all]"
+FROM ${BASE_IMAGE}
 
-EXPOSE 3000
+ARG RELEASE_VERSION
+ARG SOURCE_COMMIT
 
-ENTRYPOINT ["/usr/bin/tini", "--", "dstack", "server", "--host", "0.0.0.0", "--port", "3000"]
+COPY --from=build /dist/*.whl /tmp/
+
+RUN set -eu; \
+    py=/root/.local/share/uv/tools/dstack/bin/python; \
+    wheel="$(find /tmp -maxdepth 1 -type f -name 'dstack-*.whl')"; \
+    test "$(printf '%s\n' "$wheel" | wc -l)" -eq 1; \
+    statics="$("$py" -c "import dstack,pathlib;print(pathlib.Path(dstack.__file__).parent/'_internal/server/statics')")"; \
+    cp -a "$statics" /tmp/statics.bak; \
+    /root/.local/bin/uv pip install --python "$py" --no-deps --reinstall "$wheel"; \
+    mkdir -p "$statics"; \
+    cp -a /tmp/statics.bak/. "$statics"/; \
+    rm -rf /tmp/statics.bak "$wheel"; \
+    test "$(ls "$statics" | wc -l)" -gt 0
+
+ENV DSTACK_VERSION=${RELEASE_VERSION}
+ENV DSTACK_RELEASE=1
+
+LABEL org.opencontainers.image.revision=${SOURCE_COMMIT}
+LABEL org.opencontainers.image.version=${RELEASE_VERSION}
+LABEL org.carbonteq.dstack.component-set=${SOURCE_COMMIT}

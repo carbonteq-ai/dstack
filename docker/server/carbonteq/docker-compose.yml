@@ -1,9 +1,16 @@
-# Dokploy "Compose" stack for the CarbonTeq dstack fork.
+# CarbonTeq dstack MVP: server on Dokploy, workloads on a separate LAN VM.
 #
-# Everything is built from this repo, because the fork delta lives in both the
-# Python server AND the Go runner/shim binaries. Deploying only the server would
-# leave workers on upstream binaries and the bounded stop_duration would not
-# take effect.
+# The fork delta spans the Python server AND the Go runner/shim, so both are
+# built here from the same commit. The `binaries` service serves the runner and
+# shim over HTTP; the worker VM downloads them from it.
+#
+# Required variables (set these in Dokploy's Environment tab):
+#
+#   DSTACK_POSTGRES_PASSWORD    generated
+#   DSTACK_SERVER_ADMIN_TOKEN   generated
+#   DSTACK_RELEASE_VERSION      output of ./version.sh  (bump on every rebuild)
+#   DSTACK_BINARIES_URL         http://<dokploy-vm-lan-ip>:8080   (no trailing /)
+#   DSTACK_SERVER_URL           http://<dokploy-vm-lan-ip>:3000
 
 name: dstack-cp
 
@@ -23,23 +30,12 @@ services:
       timeout: 5s
       retries: 10
 
-  # Hosts the fork's runner/shim binaries. Must be reachable from the worker
-  # machines, so give this service its own Dokploy domain and use that domain in
-  # DSTACK_RUNNER_DOWNLOAD_URL / DSTACK_SHIM_DOWNLOAD_URL.
-  binaries:
-    build:
-      context: ../../..
-      dockerfile: docker/server/carbonteq/Dockerfile.binaries
-      args:
-        VERSION: ${DSTACK_COMPONENT_VERSION:?set the fork component version}
-    restart: unless-stopped
-    expose:
-      - "80"
-
   server:
     build:
       context: ../../..
       dockerfile: docker/server/carbonteq/Dockerfile
+      args:
+        RELEASE_VERSION: ${DSTACK_RELEASE_VERSION:?run ./version.sh}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -47,64 +43,35 @@ services:
     environment:
       DSTACK_DATABASE_URL: postgresql+asyncpg://${DSTACK_POSTGRES_USER:-dstack}:${DSTACK_POSTGRES_PASSWORD}@postgres:5432/${DSTACK_POSTGRES_DB:-dstack}
       DSTACK_SERVER_ADMIN_TOKEN: ${DSTACK_SERVER_ADMIN_TOKEN:?set an admin token}
-      DSTACK_SERVER_URL: ${DSTACK_SERVER_URL:?set the public server URL}
+      DSTACK_SERVER_URL: ${DSTACK_SERVER_URL:?set the server URL}
       DSTACK_SERVER_LOG_FORMAT: json
-      DSTACK_SERVER_LOG_LEVEL: INFO
-      # Source builds leave version.py at 0.0.0, so DSTACK_VERSION resolves to
-      # None and the CLI turns on uvicorn autoreload. Off, explicitly.
-      DSTACK_SERVER_RELOAD_DISABLED: "1"
+      DSTACK_SERVER_LOG_LEVEL: ${DSTACK_SERVER_LOG_LEVEL:-INFO}
 
-      # Fork rollout. Both the version and the download URL are required:
-      # the server only installs a component when it knows an expected version
-      # and that version differs from what the worker reports.
-      #
-      # Do NOT set DSTACK_VERSION to the fork version. It is parsed as PEP 440
-      # and a value like "0.20.29-ct1" raises ValueError at import. These two
-      # vars are read as raw strings, so any label is safe here.
-      DSTACK_RUNNER_VERSION: ${DSTACK_COMPONENT_VERSION}
-      DSTACK_SHIM_VERSION: ${DSTACK_COMPONENT_VERSION}
-      DSTACK_RUNNER_DOWNLOAD_URL: ${DSTACK_BINARIES_URL}/{version}/binaries/dstack-runner-linux-{arch}
+      # One version drives the server, runner and shim. DSTACK_VERSION is baked
+      # into the image by the Dockerfile; these two tell the server which
+      # component build every worker must be running.
+      DSTACK_RUNNER_VERSION: ${DSTACK_RELEASE_VERSION}
+      DSTACK_SHIM_VERSION: ${DSTACK_RELEASE_VERSION}
+      DSTACK_RUNNER_DOWNLOAD_URL: ${DSTACK_BINARIES_URL:?set the binaries URL}/{version}/binaries/dstack-runner-linux-{arch}
       DSTACK_SHIM_DOWNLOAD_URL: ${DSTACK_BINARIES_URL}/{version}/binaries/dstack-shim-linux-{arch}
-
-      DSTACK_SSHPROXY_API_TOKEN: ${DSTACK_SSHPROXY_API_TOKEN:?set a proxy token}
-      DSTACK_SERVER_SSHPROXY_ADDRESS: ${DSTACK_SERVER_SSHPROXY_ADDRESS:?set host:30022}
     volumes:
       # config.yml (backend credentials) + run logs. Postgres holds the rest.
       - server-data:/root/.dstack/server
-    expose:
-      - "3000"
-
-  sshproxy-keygen:
-    image: alpine:3
-    command:
-      - sh
-      - -c
-      - |
-        apk add --no-cache openssh-keygen >/dev/null
-        [ -f /keys/host_key ] || ssh-keygen -t ed25519 -f /keys/host_key -N "" -C dstack-sshproxy
-    volumes:
-      - sshproxy-keys:/keys
-
-  sshproxy:
-    image: dstackai/sshproxy:latest
-    platform: linux/amd64
-    restart: unless-stopped
-    depends_on:
-      sshproxy-keygen:
-        condition: service_completed_successfully
-      server:
-        condition: service_started
-    environment:
-      DSTACK_SSHPROXY_API_URL: http://server:3000
-      DSTACK_SSHPROXY_API_TOKEN: ${DSTACK_SSHPROXY_API_TOKEN}
-    command: ["--host-key", "/keys/host_key"]
-    volumes:
-      - sshproxy-keys:/keys
-    # Raw TCP: Traefik's HTTP routers cannot carry this, it needs a host port.
     ports:
-      - "30022:30022"
+      - "3000:3000"
+
+  # The worker VM downloads the fork's runner and shim from here, so this port
+  # must be reachable from the worker over the LAN.
+  binaries:
+    build:
+      context: ../../..
+      dockerfile: docker/server/carbonteq/Dockerfile.binaries
+      args:
+        VERSION: ${DSTACK_RELEASE_VERSION}
+    restart: unless-stopped
+    ports:
+      - "8080:80"
 
 volumes:
   postgres-data:
   server-data:
-  sshproxy-keys:

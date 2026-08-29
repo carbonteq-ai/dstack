@@ -1,89 +1,151 @@
-# Deploying the CarbonTeq dstack fork on Dokploy
+# CarbonTeq dstack MVP
 
-Upstream's published image (`dstackai/dstack`) does not contain this fork. The
-delta spans two artifacts — the Python server and the Go `dstack-runner` /
-`dstack-shim` binaries — and `CARBONTEQ_FORK.md` requires both to come from the
-same commit. A patched server with an old runner still gives a job ten seconds;
-a patched runner with an old server receives no bounded field.
+A two-machine prototype of the fork: the dstack server on a Dokploy VM, and one
+Unraid VM as the SSH-fleet worker. It is a scale model of the `ai-infra`
+production topology, with the release contract kept faithful and the operational
+machinery (registry, internal CA, Ansible, leases, receipts, rollback) dropped.
 
-So the stack builds both, and serves the binaries over HTTP so the server can
-install them onto SSH-fleet workers.
+## Why the server is built at all
 
-## Dokploy setup
+The published `dstackai/dstack` image contains neither half of the fork delta,
+which spans the Python server *and* the Go runner/shim. A server-only patch is
+not enough: the graceful-stop deadline is serialized by the server and enforced
+by the runner. So one commit produces one version, one server image, and two
+binaries.
 
-1. **Create a Compose application** pointing at this repo, branch
-   `dstack-cp-mvp`, compose path `docker/server/carbonteq/docker-compose.yml`.
-2. **Domains** — two services need to be reachable:
-   - `server` → port `3000`, your control-plane domain.
-   - `binaries` → port `80`, a domain the **worker machines** can reach. Workers
-     fetch the runner/shim from here; if it is not publicly resolvable the
-     rollout silently never happens.
-3. **Port `30022`** is raw SSH for the proxy. Traefik's HTTP routers cannot
-   carry it, so it stays a published host port in the compose file. Open it in
-   the host firewall.
-4. **Set the environment variables** below in Dokploy's Environment tab.
-5. Deploy. First build is slow (npm + Go + uv); later ones hit layer cache.
+`Dockerfile` follows the production pattern — start from the digest-pinned
+upstream image and replace only the project wheel, so the dependency graph stays
+upstream's immutable one. It differs in preserving the upstream web UI across
+the swap; a source-built wheel has no statics, so a plain `--reinstall` would
+leave the server with no dashboard.
 
-## Environment variables
+## Layout
 
-### Required
+| Machine | Runs |
+| --- | --- |
+| Dokploy VM | `postgres`, `server`, `binaries` |
+| Worker VM | Docker, sshd; dstack installs the shim and runner itself |
+| Your laptop | the `dstack` CLI |
 
-| Variable | Example | Notes |
-| --- | --- | --- |
-| `DSTACK_POSTGRES_PASSWORD` | *(generated)* | Also used to build `DSTACK_DATABASE_URL`. |
-| `DSTACK_SERVER_ADMIN_TOKEN` | *(uuid)* | Without it the token is regenerated and only printed to logs. |
-| `DSTACK_SERVER_URL` | `https://dstack.example.com` | Public URL. Used in links the server hands out. |
-| `DSTACK_COMPONENT_VERSION` | `0.20.29-ct1` | The fork's component version. Stamped into the binaries via `-X main.Version` and compared against what each worker reports. Bump it on every rebuild or workers keep their existing binaries. |
-| `DSTACK_BINARIES_URL` | `https://dstack-bin.example.com` | Public base URL of the `binaries` service. No trailing slash. |
-| `DSTACK_SSHPROXY_API_TOKEN` | *(secret)* | Shared between server and proxy. |
-| `DSTACK_SERVER_SSHPROXY_ADDRESS` | `dstack.example.com:30022` | Address **clients** use to reach the proxy, not an internal one. |
+Two flows, in opposite directions: the **server dials out to the worker on port
+22** (everything else is tunnelled inside that connection), and the **worker
+fetches the fork binaries from `binaries` over HTTP**.
 
-### Optional
+## 1. Prepare the worker VM
 
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `DSTACK_POSTGRES_USER` | `dstack` | |
-| `DSTACK_POSTGRES_DB` | `dstack` | |
-| `DSTACK_SERVER_LOG_LEVEL` | `INFO` | `DEBUG` shows the runner-install decisions. |
-| `DSTACK_SERVER_S3_BUCKET` / `DSTACK_SERVER_GCS_BUCKET` | — | External file storage. |
-| `DSTACK_SERVER_CLOUDWATCH_LOG_GROUP` | — | External logs storage; otherwise logs live on the `server-data` volume. |
-| `DSTACK_SENTRY_DSN` | — | |
+Ubuntu, 2 vCPU / 4 GB is enough for a CPU-only cancellation test.
 
-### Set by the compose file — do not override
+```
+sudo apt update && sudo apt install -y docker.io openssh-server sudo
+sudo useradd -m -s /bin/bash dstack && sudo usermod -aG docker dstack
+echo 'dstack ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/dstack
+```
 
-`DSTACK_RUNNER_VERSION`, `DSTACK_SHIM_VERSION`, `DSTACK_RUNNER_DOWNLOAD_URL`,
-`DSTACK_SHIM_DOWNLOAD_URL` are derived from `DSTACK_COMPONENT_VERSION` and
-`DSTACK_BINARIES_URL`. `DSTACK_SERVER_RELOAD_DISABLED` is pinned on.
+Add your public key to `/home/dstack/.ssh/authorized_keys`, and confirm
+`AllowTcpForwarding yes` in `/etc/ssh/sshd_config` (the Ubuntu default). dstack
+requires it for the tunnels.
 
-### Do not set
+## 2. Check the two network paths
 
-**`DSTACK_VERSION`.** It is parsed as PEP 440 at import
-(`_internal/utils/version.py`), so a value like `0.20.29-ct1` raises
-`ValueError: Invalid version` and the server will not start. It also
-short-circuits both runner and shim version resolution. Leave it unset — the
-runner/shim vars above are read as raw strings and accept any label.
+Before deploying anything. From the Dokploy VM:
 
-## Two things that will bite you
+```
+ping -c2 <WORKER_LAN_IP>
+docker run --rm alpine nc -zv -w3 <WORKER_LAN_IP> 22
+```
 
-**Autoreload.** A source build leaves `version.py` at `0.0.0`, which resolves
-`DSTACK_VERSION` to `None`, which turns uvicorn's autoreload on
-(`cli/commands/server.py`). The compose file sets
-`DSTACK_SERVER_RELOAD_DISABLED=1`; keep it.
+If the ping fails it is the Unraid VM network mode, not Docker — put both VMs on
+`br0`. If the ping passes and the container check fails, the likely cause is a
+LAN in the `172.16–172.31.x.x` range colliding with Docker's bridge subnet.
 
-**Architecture.** The server substitutes `{arch}` from each *worker's* CPU
-architecture, defaulting to `amd64`. `Dockerfile.binaries` builds one arch — the
-Dokploy host's. That matches the fork's supported path (Linux AMD64 SSH-fleet
-workers). An arm64 worker would 404 on download; build and serve an arm64
-binary too if you have one.
+## 3. Compute the version
 
-## Verifying the rollout
+```
+./docker/server/carbonteq/version.sh
+```
 
-The server only installs a component when it knows an expected version *and*
-that version differs from what the worker reports
-(`background/pipeline_tasks/instances/check.py`). So:
+This is the `ai-infra` release contract: `<upstream tag>+carbonteq.g<12 commit
+chars>`. It is valid PEP 440, and the `g` prefix stops an all-numeric commit
+prefix being normalized as a numeric local-version component.
 
-1. `curl https://dstack-bin.example.com/0.20.29-ct1/binaries/dstack-runner-linux-amd64 -o /dev/null -w '%{http_code}\n'` → `200`.
-2. Server logs at `DEBUG` should show `installing runner (no version) -> 0.20.29-ct1 from ...` per instance.
-3. Run the live gate from `CARBONTEQ_FORK.md`: a task whose handler takes more
-   than ten seconds but less than the configured `stop_duration`, cancelled
-   mid-run. It must finalize rather than be killed at ten seconds.
+**Bump it on every rebuild.** The server installs a component onto a worker only
+when the expected version differs from what that worker reports, so a stale
+version means workers silently keep their old binaries.
+
+## 4. Deploy on Dokploy
+
+Compose application → this repo, branch `dstack-cp-mvp`, compose path
+`docker/server/carbonteq/docker-compose.yml`. Environment:
+
+```
+DSTACK_POSTGRES_PASSWORD=<generated>
+DSTACK_SERVER_ADMIN_TOKEN=<generated>
+DSTACK_RELEASE_VERSION=<output of version.sh>
+DSTACK_SERVER_URL=http://<dokploy-vm-lan-ip>:3000
+DSTACK_BINARIES_URL=http://<dokploy-vm-lan-ip>:8080
+```
+
+Port 8080 must be reachable from the worker VM. Verify from the worker:
+
+```
+curl -sI "http://<dokploy-vm-lan-ip>:8080/<version>/binaries/dstack-runner-linux-amd64"
+```
+
+A 404 or timeout here means the rollout will silently never happen.
+
+## 5. Enrol the worker
+
+```
+dstack project add --name main --url http://<dokploy-vm-lan-ip>:3000 --token <admin token>
+dstack apply -f fleet.dstack.yml
+```
+
+```yaml
+type: fleet
+name: mvp-workers
+ssh_config:
+  user: dstack
+  identity_file: ~/.ssh/id_rsa
+  hosts:
+    - <WORKER_LAN_IP>
+```
+
+## 6. Prove the fork is live
+
+Adapted from `ai-infra`'s `jobs/cancellation-smoke/task.dstack.yml`, with the
+GPU block and private image removed:
+
+```yaml
+type: task
+name: cancellation-smoke
+image: ubuntu:24.04
+shell: /bin/bash
+commands:
+  - |
+    echo cancellation-ready
+    : > /tmp/graceful-stop.markers
+    trap 'printf "%s\n" graceful-stop-start | tee /tmp/graceful-stop.markers; sleep 20; printf "%s\n" graceful-stop-complete | tee -a /tmp/graceful-stop.markers; sync; exit 0' INT TERM
+    while true; do sleep 1 & wait $! || true; done
+resources:
+  cpu: 2..
+  memory: 2GB..
+fleets: [mvp-workers]
+max_duration: 5m
+stop_duration: 45s
+retry: false
+```
+
+`dstack apply`, wait for `cancellation-ready`, then cancel. The handler sleeps
+20 seconds — well past upstream's fixed ten-second kill. Seeing
+`graceful-stop-complete` is the fork working. Being killed at ten seconds means
+the worker is still on upstream binaries; check the binaries URL and that you
+bumped the version.
+
+## Notes
+
+- The architecture is resolved from each *worker's* CPU, defaulting to `amd64`.
+  `Dockerfile.binaries` builds only the Dokploy host's arch, which matches the
+  fork's supported path (Linux AMD64). An arm64 worker would 404.
+- This proves dstack component propagation, signal delivery, and stop grace. It
+  does not prove the framework's Trackio finalization barrier, which has its own
+  gate in the framework plan.
