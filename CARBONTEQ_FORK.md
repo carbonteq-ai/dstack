@@ -9,7 +9,54 @@ Published candidate branch. The working tree is based on upstream dstack
 by full SHA; deployment remains blocked until one matching server/runner/shim
 release is built and qualified.
 
+The active `codex/registry-default-auth` working branch adds the exact-host
+registry credential and live RunPod GPU-offer behavior below on top of published commit
+`275b81bc725967c8925b5b12d96500dc60a45370`. It is not a reproducible consumer
+selection until committed and pushed.
+
 ## Maintained delta
+
+### Apply server registry credentials to an explicit exact-match host
+
+Posttrain submits a fully qualified, digest-pinned canonical image. Upstream's
+`apply_server_docker_defaults` returns before applying server-owned credentials
+whenever an image already contains a registry host, so provider-native pulls
+and the runner receive no authentication for that private canonical registry.
+
+The candidate delta applies `DSTACK_SERVER_DEFAULT_DOCKER_REGISTRY_USERNAME`
+and `DSTACK_SERVER_DEFAULT_DOCKER_REGISTRY_PASSWORD` when, and only when, the
+explicit image registry exactly equals `DSTACK_SERVER_DEFAULT_DOCKER_REGISTRY`
+and the run did not supply explicit auth. It does not rewrite the image and
+does not recognize prefixes, suffixes, or port-mismatched hosts. Existing
+unqualified-image behavior and explicit run-auth precedence remain unchanged.
+
+Regression coverage in
+`src/tests/_internal/server/services/test_docker.py` includes exact match,
+port mismatch, malicious prefix/suffix mismatch, explicit-auth precedence,
+incomplete server credentials, and the existing unqualified-image cases.
+
+### Resolve RunPod GPU spot offers from live capacity
+
+The gpuhunt offline RunPod catalog is still useful for normalized hardware,
+CPU and cluster shapes, and on-demand baseline pricing, but its current
+published rows contain no spot offers. Treating every offline row as available
+also cannot represent RunPod's volatile stock. This prevented dstack from
+planning an interruptible RunPod Pod even when RunPod's live GraphQL API
+reported capacity and a current spot price.
+
+The candidate delta keeps the offline catalog for on-demand, CPU, and cluster
+planning. A non-multinode GPU request that permits spot now queries RunPod's
+live provider for only the requested GPU count and allowed locations, filters
+Community Cloud unless configured, and converts the currently stocked rows
+through dstack's existing requirement and offer normalization. The final Pod
+creation mutation remains the authoritative capacity check because capacity
+can disappear after discovery; normal dstack retry behavior handles that race.
+
+Regression coverage in
+`src/tests/_internal/core/backends/runpod/test_compute.py` verifies bounded
+Secure Cloud discovery, live spot conversion, and preservation of the offline
+on-demand path. A live read-only check returned current RTX PRO 6000 and A100
+80 GB Secure Cloud spot rows in approximately six seconds.
 
 ### Honor bounded task stop duration
 
@@ -122,6 +169,16 @@ Ruff check and format check passed
 git diff --check passed
 ```
 
+The unpublished exact-host credential delta additionally passes 38 focused
+Docker-default and job-service tests plus Ruff and `git diff --check`.
+The unpublished RunPod live-offer delta passes all seven RunPod backend tests,
+including its three new compute tests, plus Ruff and `git diff --check`.
+Resolving a fresh unpinned dev environment and running the two broader
+submitted/running pipeline files produced 106 passes, 110 PostgreSQL skips,
+and eight SQLite failures in unrelated multinode placeholder, cluster-lock,
+and placement-group expectations. Re-run those gates in the pinned release
+environment before publication; they are not represented as passing here.
+
 Before publication, repeat the Python suite with PostgreSQL enabled, build the
 server and both binaries from the immutable candidate commit, and run a live
 Docker cancellation whose handler takes more than ten seconds but less than
@@ -137,5 +194,6 @@ cancellation gate. Retire the fork only after an upstream release propagates
 the same bounded value through both server and runner and passes the CarbonTeq
 qualification unchanged.
 
-Published fork commit: branch `codex/graceful-cancellation-stop-duration`
-(record the exact head SHA in the consumer repository after publication).
+Published fork commit: `275b81bc725967c8925b5b12d96500dc60a45370` on branch
+`codex/graceful-cancellation-stop-duration`. The exact-host credential branch
+has no published commit yet.

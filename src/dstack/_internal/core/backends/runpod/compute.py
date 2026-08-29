@@ -1,12 +1,16 @@
 import json
 import uuid
 from collections.abc import Iterable
+from dataclasses import asdict
 from datetime import timedelta
 from typing import Callable, List, Optional
 
+import gpuhunt
+from gpuhunt.providers.runpod import RunpodProvider
+
 from dstack._internal.core.backends.base.backend import Compute
 from dstack._internal.core.backends.base.compute import (
-    ComputeWithAllOffersCached,
+    ComputeWithFilteredOffersCached,
     ComputeWithGroupProvisioningSupport,
     ComputeWithMultinodeSupport,
     ComputeWithVolumeSupport,
@@ -18,8 +22,10 @@ from dstack._internal.core.backends.base.compute import (
 from dstack._internal.core.backends.base.models import JobConfiguration
 from dstack._internal.core.backends.base.offers import (
     OfferModifier,
+    catalog_item_to_offer,
     get_catalog_offers,
     get_offers_disk_modifier,
+    requirements_to_query_filter,
 )
 from dstack._internal.core.backends.runpod.api_client import RunpodApiClient, RunpodApiClientError
 from dstack._internal.core.backends.runpod.models import RunpodConfig
@@ -33,6 +39,7 @@ from dstack._internal.core.models.compute_groups import ComputeGroup, ComputeGro
 from dstack._internal.core.models.instances import (
     InstanceAvailability,
     InstanceConfiguration,
+    InstanceOffer,
     InstanceOfferWithAvailability,
     SSHKey,
 )
@@ -63,7 +70,7 @@ class RunpodOfferBackendData(CoreModel):
 
 
 class RunpodCompute(
-    ComputeWithAllOffersCached,
+    ComputeWithFilteredOffersCached,
     ComputeWithVolumeSupport,
     ComputeWithMultinodeSupport,
     ComputeWithGroupProvisioningSupport,
@@ -76,13 +83,23 @@ class RunpodCompute(
         self.config = config
         self.api_client = RunpodApiClient(config.creds.api_key)
 
-    def get_all_offers_with_availability(self) -> List[InstanceOfferWithAvailability]:
-        offers = get_catalog_offers(
-            backend=BackendType.RUNPOD,
-            locations=self.config.regions or None,
-            requirements=None,
-            extra_filter=lambda o: _is_secure_cloud(o.region) or self.config.allow_community_cloud,
-        )
+    def get_offers_by_requirements(
+        self, requirements: Requirements
+    ) -> List[InstanceOfferWithAvailability]:
+        if _should_query_live_gpu_offers(requirements):
+            offers = _get_live_gpu_offers(
+                requirements=requirements,
+                regions=self.config.regions,
+                allow_community_cloud=self.config.allow_community_cloud,
+            )
+        else:
+            offers = get_catalog_offers(
+                backend=BackendType.RUNPOD,
+                locations=self.config.regions or None,
+                requirements=requirements,
+                extra_filter=lambda o: _is_secure_cloud(o.region)
+                or self.config.allow_community_cloud,
+            )
         offers = [
             offer.with_availability(availability=InstanceAvailability.AVAILABLE)
             for offer in offers
@@ -486,3 +503,79 @@ def _get_offer_pod_counts(offer: InstanceOfferWithAvailability) -> list[int]:
     )
     pod_counts = backend_data.pod_counts or []
     return pod_counts
+
+
+class _RunpodLiveGPUProvider(RunpodProvider):
+    """Bound RunPod's live catalog query to the GPU counts and locations a run can use."""
+
+    def __init__(
+        self,
+        gpu_counts: range,
+        regions: Optional[List[str]],
+        allow_community_cloud: bool,
+    ) -> None:
+        self._gpu_counts = set(gpu_counts)
+        self._regions = set(regions or [])
+        self._allow_community_cloud = allow_community_cloud
+        super().__init__()
+
+    def _build_query_variables(self) -> list[dict]:
+        variables = super()._build_query_variables()
+        bounded = []
+        for variable in variables:
+            lowest_price = variable["lowestPriceInput"]
+            if lowest_price["gpuCount"] not in self._gpu_counts:
+                continue
+            if not self._allow_community_cloud and not lowest_price["secureCloud"]:
+                continue
+            location = lowest_price.get("dataCenterId") or lowest_price.get("countryCode")
+            if self._regions and location not in self._regions:
+                continue
+            bounded.append(variable)
+        return bounded
+
+    def _fetch_cluster_offers(self) -> list[gpuhunt.RawCatalogItem]:
+        return []
+
+    def _fetch_cpu_offers(self) -> list[gpuhunt.RawCatalogItem]:
+        return []
+
+
+def _should_query_live_gpu_offers(requirements: Requirements) -> bool:
+    gpu = requirements.resources.gpu
+    return (
+        not requirements.multinode
+        and requirements.spot is not False
+        and gpu is not None
+        and (gpu.count.min or 0) > 0
+    )
+
+
+def _get_live_gpu_offers(
+    requirements: Requirements,
+    regions: Optional[List[str]],
+    allow_community_cloud: bool,
+) -> List[InstanceOffer]:
+    gpu = get_or_error(requirements.resources.gpu)
+    min_gpu_count = gpu.count.min or 1
+    max_gpu_count = gpu.count.max or min_gpu_count
+    provider = _RunpodLiveGPUProvider(
+        gpu_counts=range(min_gpu_count, max_gpu_count + 1),
+        regions=regions,
+        allow_community_cloud=allow_community_cloud,
+    )
+    query_filter = requirements_to_query_filter(requirements)
+    offers = []
+    for raw_item in RunpodProvider.filter(provider.get(query_filter=query_filter)):
+        item = gpuhunt.CatalogItem(provider=BackendType.RUNPOD.value, **asdict(raw_item))
+        if not gpuhunt.matches(item, q=query_filter):
+            continue
+        offer = catalog_item_to_offer(
+            backend=BackendType.RUNPOD,
+            item=item,
+            requirements=requirements,
+            configurable_disk_size=CONFIGURABLE_DISK_SIZE,
+        )
+        if offer is not None:
+            offers.append(offer)
+    return offers
