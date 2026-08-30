@@ -50,6 +50,26 @@ class TestRunpodConfigurator:
         assert configurator.get_backend_config_without_creds(record).run_storage == run_storage
         assert configurator.get_backend(record).config.run_storage == run_storage
 
+    def test_run_storage_can_select_from_backend_region_pool(self):
+        run_storage = RunpodRunStorageConfig(size="10GB", path="/workspace")
+        config = RunpodBackendConfigWithCreds(
+            creds=RunpodCreds(api_key="valid"),
+            regions=["US-CA-2", "US-KS-2"],
+            run_storage=run_storage,
+        )
+
+        assert config.run_storage == run_storage
+        assert config.regions == ["US-CA-2", "US-KS-2"]
+
+    @pytest.mark.parametrize("regions", [None, [], ["US"]])
+    def test_pooled_run_storage_requires_secure_backend_regions(self, regions):
+        with pytest.raises(ValidationError):
+            RunpodBackendConfigWithCreds(
+                creds=RunpodCreds(api_key="valid"),
+                regions=regions,
+                run_storage=RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+
     @pytest.mark.parametrize("value", [599, 3601])
     def test_provisioning_timeout_is_bounded(self, value: int):
         with pytest.raises(ValidationError):

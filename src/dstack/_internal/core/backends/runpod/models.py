@@ -1,6 +1,6 @@
 from typing import Annotated, List, Literal, Optional, Union
 
-from pydantic import Field, validator
+from pydantic import Field, root_validator, validator
 
 from dstack._internal.core.models.common import CoreModel
 from dstack._internal.core.models.provisioning_preconditions import (
@@ -16,9 +16,14 @@ RUNPOD_COMMUNITY_CLOUD_DEFAULT = False
 
 class RunpodRunStorageConfig(CoreModel):
     region: Annotated[
-        str,
-        Field(description="The Secure Cloud data center where run volumes are created"),
-    ]
+        Optional[str],
+        Field(
+            description=(
+                "A fixed Secure Cloud data center for run volumes. Omit to select from "
+                "the backend regions using current job offers"
+            )
+        ),
+    ] = None
     size: Annotated[Memory, Field(description="The size of each run volume")]
     path: Annotated[
         str,
@@ -26,7 +31,9 @@ class RunpodRunStorageConfig(CoreModel):
     ] = "/workspace"
 
     @validator("region")
-    def validate_secure_cloud_region(cls, value: str) -> str:
+    def validate_secure_cloud_region(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
         if "-" not in value:
             raise ValueError("RunPod network volumes require a Secure Cloud data center")
         return value
@@ -88,6 +95,20 @@ class RunpodBackendConfig(CoreModel):
             )
         ),
     ] = None
+
+    @root_validator
+    def validate_run_storage_regions(cls, values):
+        run_storage = values.get("run_storage")
+        regions = values.get("regions")
+        if run_storage is None or run_storage.region is not None:
+            return values
+        if not regions:
+            raise ValueError(
+                "RunPod managed run storage requires backend regions or a fixed run_storage region"
+            )
+        if any("-" not in region for region in regions):
+            raise ValueError("RunPod network volumes require Secure Cloud data centers")
+        return values
 
 
 class RunpodBackendConfigWithCreds(RunpodBackendConfig):

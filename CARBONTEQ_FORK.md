@@ -60,6 +60,34 @@ Secure Cloud discovery, live spot conversion, and preservation of the offline
 on-demand path. A live read-only check returned current RTX PRO 6000 and A100
 80 GB Secure Cloud spot rows in approximately six seconds.
 
+### Select managed run storage from an infrastructure region pool
+
+Managed RunPod storage may now omit a fixed data center when the backend owns
+an ordered Secure Cloud region pool. Before creating the run-scoped network
+volume, dstack evaluates live offers for the actual job requirements and picks
+the first configured region with eligible capacity. The created volume then
+pins every attempt of that run to the selected data center. Fixed-region
+configuration remains supported for compatibility.
+
+This keeps regional policy in infrastructure configuration while workload
+clients specify only resource, spot, and price requirements. Focused tests
+cover configuration validation, pool priority, and the legacy fixed-region
+path.
+
+### Keep environment values out of diagnostic logs
+
+The runner previously attached the complete `cmd.Env` list to its `Starting
+exec` trace event. A server-side diagnostic log request could therefore expose
+provider, registry, tracking, and workload credentials even though those
+values were supplied through protected configuration.
+
+The candidate now emits only sorted environment variable names. Values never
+enter the trace event. `TestEnvNames_DoesNotExposeValues` covers secrets,
+ordinary values, values containing additional equals signs, and malformed
+entries. This change is currently an uncommitted successor to published commit
+`d2586c3871525e461bcbc442deaa511af2a87758` and must not be selected until the
+fork is committed, pushed, packaged, and qualified as one matching release.
+
 ### Honor bounded task stop duration
 
 Upstream resolves `stop_duration` in the server job model but omits it from the
@@ -175,6 +203,8 @@ The published exact-host credential delta additionally passes 38 focused
 Docker-default and job-service tests plus Ruff and `git diff --check`.
 The published RunPod live-offer delta passes all seven RunPod backend tests,
 including its three new compute tests, plus Ruff and `git diff --check`.
+The unpublished diagnostic-redaction successor passes the complete Go executor
+package under Go 1.25, including the new no-values regression test.
 The provisioning-timeout successor passes twelve focused RunPod configuration and
 timeout tests plus Ruff; the broader submitted-job run retains its eight known
 SQLite multinode/placement failures and adds no new failure.

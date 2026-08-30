@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -45,6 +46,18 @@ func ParseEnvList(list []string) EnvMap {
 		}
 	}
 	return em
+}
+
+func envNames(list []string) []string {
+	names := make([]string, 0, len(list))
+	for _, item := range list {
+		name, _, found := strings.Cut(item, "=")
+		if found {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // interpolateVariables expands variables as follows:

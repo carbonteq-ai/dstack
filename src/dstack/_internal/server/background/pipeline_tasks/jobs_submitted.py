@@ -401,6 +401,7 @@ class _DeferSubmittedJobResult:
 @dataclass
 class _EnsureRunStorageResult:
     configuration: RunpodRunStorageConfig
+    region: str
 
 
 @dataclass
@@ -629,6 +630,7 @@ async def _apply_assignment_result(
                 context=context,
                 job_model=job_model,
                 configuration=assignment.configuration,
+                region=assignment.region,
             )
             await _defer_submitted_job(
                 session=session,
@@ -928,7 +930,12 @@ async def _process_preconditions(
                 )
             )
         if owned_volume is None:
-            return _EnsureRunStorageResult(configuration=run_storage)
+            region = await _select_run_storage_region(context, run_storage)
+            if region is None:
+                return _DeferSubmittedJobResult(
+                    log_message="waiting for RunPod capacity in the managed storage region pool"
+                )
+            return _EnsureRunStorageResult(configuration=run_storage, region=region)
         if owned_volume.status == VolumeStatus.FAILED:
             return _TerminateSubmittedJobResult(
                 reason=JobTerminationReason.VOLUME_ERROR,
@@ -966,11 +973,54 @@ async def _get_required_run_storage(
     return backend.config.run_storage
 
 
+async def _select_run_storage_region(
+    context: _SubmittedJobContext,
+    configuration: RunpodRunStorageConfig,
+) -> Optional[str]:
+    if configuration.region is not None:
+        return configuration.region
+    backend = await get_project_backend_by_type(
+        project=context.project,
+        backend_type=BackendType.RUNPOD,
+    )
+    if not isinstance(backend, RunpodBackend) or not backend.config.regions:
+        return None
+    profile = context.run.run_spec.merged_profile
+    requirements = context.job.job_spec.requirements
+    if context.fleet_model is not None:
+        effective = _get_effective_profile_and_requirements(
+            job_model=context.job_model,
+            run=context.run,
+            job=context.job,
+            fleet_model=context.fleet_model,
+        )
+        if effective is None:
+            return None
+        profile, requirements = effective
+    offers = await get_offers_by_requirements(
+        project=context.project,
+        profile=profile,
+        requirements=requirements,
+        exclude_not_available=True,
+        multinode=context.multinode,
+        privileged=context.job.job_spec.privileged,
+        instance_mounts=False,
+    )
+    available_regions = {
+        offer.region.lower() for _, offer in offers if offer.backend == BackendType.RUNPOD
+    }
+    return next(
+        (region for region in backend.config.regions if region.lower() in available_regions),
+        None,
+    )
+
+
 async def _apply_ensure_run_storage(
     session: AsyncSession,
     context: _SubmittedJobContext,
     job_model: JobModel,
     configuration: RunpodRunStorageConfig,
+    region: str,
 ) -> None:
     existing = await session.scalar(
         select(VolumeModel).where(
@@ -985,7 +1035,7 @@ async def _apply_ensure_run_storage(
     mount = VolumeMountPoint(name=volume_name, path=configuration.path)
     volume_configuration = RunpodVolumeConfiguration(
         name=volume_name,
-        region=configuration.region,
+        region=region,
         size=configuration.size,
         auto_cleanup_duration="off",
         tags={"dstack-run-id": str(context.run_model.id)},
@@ -1441,6 +1491,7 @@ async def _apply_provisioning_result(
                 context=context,
                 job_model=job_model,
                 configuration=provisioning.configuration,
+                region=provisioning.region,
             )
             await _defer_submitted_job(
                 session=session,

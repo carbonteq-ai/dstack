@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
+from dstack._internal.core.backends.runpod.models import RunpodRunStorageConfig
 from dstack._internal.core.errors import BackendError
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.common import EntityReference, NetworkMode, RegistryAuth
@@ -48,6 +49,7 @@ from dstack._internal.server.background.pipeline_tasks.jobs_submitted import (
     JobSubmittedPipelineItem,
     JobSubmittedWorker,
     _load_submitted_job_context,
+    _select_run_storage_region,
 )
 from dstack._internal.server.models import (
     ComputeGroupModel,
@@ -378,6 +380,61 @@ class TestJobSubmittedFetcher:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
 class TestJobSubmittedWorker:
+    async def test_managed_storage_selects_first_available_in_backend_region_pool(
+        self, test_db, session: AsyncSession
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        await create_backend(
+            session=session,
+            project_id=project.id,
+            backend_type=BackendType.RUNPOD,
+            config={
+                "regions": ["US-CA-2", "US-KS-2"],
+                "run_storage": {"size": "10GB", "path": "/workspace"},
+            },
+            auth={"type": "api_key", "api_key": "test-api-key"},
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=get_run_spec(
+                repo_id=repo.name,
+                configuration=TaskConfiguration(image="debian", nodes=1),
+                profile=Profile(spot_policy=SpotPolicy.SPOT),
+            ),
+        )
+        job = await create_job(session=session, run=run)
+        context = await _load_submitted_job_context(session=session, job_model=job)
+        offers = [
+            (
+                Mock(),
+                get_instance_offer_with_availability(
+                    backend=BackendType.RUNPOD, region="US-KS-2", spot=True
+                ),
+            ),
+            (
+                Mock(),
+                get_instance_offer_with_availability(
+                    backend=BackendType.RUNPOD, region="US-CA-2", spot=True
+                ),
+            ),
+        ]
+
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+            new=AsyncMock(return_value=offers),
+        ):
+            region = await _select_run_storage_region(
+                context,
+                RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+
+        assert region == "US-CA-2"
+
     async def test_creates_one_managed_volume_for_runpod_spot_task(
         self, test_db, session: AsyncSession, worker: JobSubmittedWorker
     ):

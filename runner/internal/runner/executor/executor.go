@@ -582,7 +582,13 @@ func (ex *RunExecutor) execJob(ctx context.Context, jobLogFile io.Writer) error 
 	envMap["HOME"] = ex.jobUser.HomeDir
 	cmd.Env = envMap.Render()
 
-	log.Trace(ctx, "Starting exec", "cmd", cmd.String(), "working_dir", cmd.Dir, "env", cmd.Env)
+	log.Trace(
+		ctx,
+		"Starting exec",
+		"cmd", cmd.String(),
+		"working_dir", cmd.Dir,
+		"env_names", envNames(cmd.Env),
+	)
 
 	ptm, err := startCommand(cmd)
 	if err != nil {
