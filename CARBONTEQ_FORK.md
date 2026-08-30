@@ -5,16 +5,15 @@
 Published candidate branch. The working tree is based on upstream dstack
 `0.20.29` at commit `2f9618f4d521140350efd1b344412d122c1e0322`.
 `origin` points to `carbonteq-ai/dstack` and `upstream` points to
-`dstackai/dstack`. Consumers may pin only the published CarbonTeq branch head
-by full SHA; deployment remains blocked until one matching server/runner/shim
-release is built and qualified.
+`dstackai/dstack`. Consumers may pin only a published CarbonTeq commit by full
+SHA. Commit `6494f15c7a36a2cdb92cec2f9b33696adb143fef` is the currently qualified
+server/runner/shim release; its regional-failover successor still requires the
+same immutable release gate.
 
 Published branch `codex/registry-default-auth` adds the exact-host registry
 credential and live RunPod GPU-offer behavior below on top of commit
-`275b81bc725967c8925b5b12d96500dc60a45370`. Its published head is
-`d2586c3871525e461bcbc442deaa511af2a87758`. Production still selects the
-preceding release because its two-worker promotion gate is not currently
-satisfied; the candidate itself has been packaged and qualified in isolation.
+`275b81bc725967c8925b5b12d96500dc60a45370`. The published pre-start regional
+failover implementation is commit `e9d74b0cfd330500879946141469313e46de2e7d`.
 
 ## Maintained delta
 
@@ -95,9 +94,8 @@ values were supplied through protected configuration.
 The candidate now emits only sorted environment variable names. Values never
 enter the trace event. `TestEnvNames_DoesNotExposeValues` covers secrets,
 ordinary values, values containing additional equals signs, and malformed
-entries. This change is currently an uncommitted successor to published commit
-`d2586c3871525e461bcbc442deaa511af2a87758` and must not be selected until the
-fork is committed, pushed, packaged, and qualified as one matching release.
+entries. It is included in the published candidate and matching immutable
+component builds.
 
 ### Honor bounded task stop duration
 
