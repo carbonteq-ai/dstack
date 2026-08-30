@@ -991,8 +991,6 @@ async def _get_required_run_storage(
     configuration = context.run.run_spec.configuration
     if configuration.type != "task" or configuration.nodes != 1:
         return None
-    if configuration.volumes:
-        return None
     if context.run.run_spec.merged_profile.spot_policy != SpotPolicy.SPOT:
         return None
     backend = await get_project_backend_by_type(
@@ -1001,7 +999,28 @@ async def _get_required_run_storage(
     )
     if not isinstance(backend, RunpodBackend):
         return None
-    return backend.config.run_storage
+    run_storage = backend.config.run_storage
+    if run_storage is None:
+        return None
+    if not configuration.volumes:
+        return run_storage
+
+    # The first managed-storage pass persists its mount in the run spec. Keep
+    # recognizing that exact run-owned mount on later submissions so an empty
+    # volume can rotate after a regional no-capacity result. Arbitrary
+    # user-configured volumes must continue to opt out of managed storage.
+    async with get_session_ctx() as session:
+        owned_volume = await session.scalar(
+            select(VolumeModel).where(
+                VolumeModel.run_id == context.run_model.id,
+            )
+        )
+    if owned_volume is None:
+        return None
+    expected_mount = VolumeMountPoint(name=owned_volume.name, path=run_storage.path)
+    if configuration.volumes != [expected_mount]:
+        return None
+    return run_storage
 
 
 async def _select_run_storage_region(

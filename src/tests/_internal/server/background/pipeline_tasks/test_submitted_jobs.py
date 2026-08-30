@@ -617,6 +617,11 @@ class TestJobSubmittedWorker:
             ),
         )
         volume.run_id = run.id
+        run_spec = get_persisted_run_spec(run)
+        run_spec.configuration.volumes = [
+            VolumeMountPoint(name=volume.name, path="/workspace")
+        ]
+        run.run_spec = run_spec.json()
         await session.commit()
 
         await _process_job(session=session, worker=worker, job_model=current_job)
