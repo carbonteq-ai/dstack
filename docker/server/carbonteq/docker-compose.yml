@@ -9,13 +9,13 @@
 #   DSTACK_POSTGRES_PASSWORD    generated
 #   DSTACK_SERVER_ADMIN_TOKEN   generated
 #   DSTACK_RELEASE_VERSION      output of ./version.sh  (bump on every rebuild)
-#   DSTACK_BINARIES_URL         http://<dokploy-vm-lan-ip>:8088   (no trailing /)
+#   DSTACK_BINARIES_URL         http://<dokploy-vm-lan-ip>:8080   (no trailing /)
 #   DSTACK_SERVER_URL           http://<dokploy-vm-lan-ip>:3001
 #
 # Optional, if the defaults clash with something else on the host:
 #
 #   DSTACK_SERVER_HOST_PORT     default 3001  (3000 is Dokploy's own UI)
-#   DSTACK_BINARIES_HOST_PORT   default 8088
+#   DSTACK_BINARIES_HOST_PORT   default 8080
 
 name: dstack-cp
 
@@ -76,8 +76,8 @@ services:
         VERSION: ${DSTACK_RELEASE_VERSION}
     restart: unless-stopped
     ports:
-      # 8080 is often taken by a Traefik dashboard, so default to 8088.
-      - "${DSTACK_BINARIES_HOST_PORT:-8088}:80"
+      # Verified free on a stock Dokploy host; override if yours differs.
+      - "${DSTACK_BINARIES_HOST_PORT:-8080}:80"
 
 volumes:
   postgres-data:

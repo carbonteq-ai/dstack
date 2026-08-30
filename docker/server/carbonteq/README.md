@@ -82,13 +82,13 @@ DSTACK_POSTGRES_PASSWORD=<generated>
 DSTACK_SERVER_ADMIN_TOKEN=<generated>
 DSTACK_RELEASE_VERSION=<output of version.sh>
 DSTACK_SERVER_URL=http://<dokploy-vm-lan-ip>:3001
-DSTACK_BINARIES_URL=http://<dokploy-vm-lan-ip>:8088
+DSTACK_BINARIES_URL=http://<dokploy-vm-lan-ip>:8080
 ```
 
-Port 8088 must be reachable from the worker VM. Verify from the worker:
+Port 8080 must be reachable from the worker VM. Verify from the worker:
 
 ```
-curl -sI "http://<dokploy-vm-lan-ip>:8088/<version>/binaries/dstack-runner-linux-amd64"
+curl -sI "http://<dokploy-vm-lan-ip>:8080/<version>/binaries/dstack-runner-linux-amd64"
 ```
 
 A 404 or timeout here means the rollout will silently never happen.
