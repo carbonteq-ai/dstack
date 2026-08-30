@@ -1006,13 +1006,24 @@ async def _select_run_storage_region(
         privileged=context.job.job_spec.privileged,
         instance_mounts=False,
     )
-    available_regions = {
-        offer.region.lower() for _, offer in offers if offer.backend == BackendType.RUNPOD
+    configured_regions = {
+        region.lower(): (index, region) for index, region in enumerate(backend.config.regions)
     }
-    return next(
-        (region for region in backend.config.regions if region.lower() in available_regions),
-        None,
+    eligible_offers = [
+        offer
+        for _, offer in offers
+        if offer.backend == BackendType.RUNPOD and offer.region.lower() in configured_regions
+    ]
+    if not eligible_offers:
+        return None
+    selected = min(
+        eligible_offers,
+        key=lambda offer: (
+            offer.price,
+            configured_regions[offer.region.lower()][0],
+        ),
     )
+    return configured_regions[selected.region.lower()][1]
 
 
 async def _apply_ensure_run_storage(

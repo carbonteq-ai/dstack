@@ -380,7 +380,7 @@ class TestJobSubmittedFetcher:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
 class TestJobSubmittedWorker:
-    async def test_managed_storage_selects_first_available_in_backend_region_pool(
+    async def test_managed_storage_selects_lowest_price_in_backend_region_pool(
         self, test_db, session: AsyncSession
     ):
         project = await create_project(session=session)
@@ -413,13 +413,19 @@ class TestJobSubmittedWorker:
             (
                 Mock(),
                 get_instance_offer_with_availability(
-                    backend=BackendType.RUNPOD, region="US-KS-2", spot=True
+                    backend=BackendType.RUNPOD,
+                    region="US-KS-2",
+                    spot=True,
+                    price=1.39,
                 ),
             ),
             (
                 Mock(),
                 get_instance_offer_with_availability(
-                    backend=BackendType.RUNPOD, region="US-CA-2", spot=True
+                    backend=BackendType.RUNPOD,
+                    region="US-CA-2",
+                    spot=True,
+                    price=1.59,
                 ),
             ),
         ]
@@ -433,7 +439,7 @@ class TestJobSubmittedWorker:
                 RunpodRunStorageConfig(size="10GB", path="/workspace"),
             )
 
-        assert region == "US-CA-2"
+        assert region == "US-KS-2"
 
     async def test_creates_one_managed_volume_for_runpod_spot_task(
         self, test_db, session: AsyncSession, worker: JobSubmittedWorker

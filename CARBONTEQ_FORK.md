@@ -65,9 +65,10 @@ on-demand path. A live read-only check returned current RTX PRO 6000 and A100
 Managed RunPod storage may now omit a fixed data center when the backend owns
 an ordered Secure Cloud region pool. Before creating the run-scoped network
 volume, dstack evaluates live offers for the actual job requirements and picks
-the first configured region with eligible capacity. The created volume then
-pins every attempt of that run to the selected data center. Fixed-region
-configuration remains supported for compatibility.
+the lowest-priced eligible offer across the configured regions. Configuration
+order is only a deterministic tie-breaker. The created volume then pins every
+attempt of that run to the selected data center. Fixed-region configuration
+remains supported for compatibility.
 
 This keeps regional policy in infrastructure configuration while workload
 clients specify only resource, spot, and price requirements. Focused tests
