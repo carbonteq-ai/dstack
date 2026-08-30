@@ -234,6 +234,19 @@ restricted to 10 through 60 minutes. Focused tests cover the bounds, public
 non-secret configuration round trip, unchanged default, 30-minute override,
 readiness-wait exclusion, and legacy fallback.
 
+### Treat provider-side Pod disappearance as authoritative during provisioning
+
+RunPod may reclaim an interruptible Pod after creation but before the runner
+connects. The upstream adapter returns silently when `get_pod()` returns no
+Pod, causing dstack to keep the logical job in `provisioning` until the full
+timeout even though the provider resource is already gone.
+
+The candidate now raises `ProvisioningError` as soon as RunPod reports the Pod
+absent. The existing instance pipeline records the provider-side loss and
+terminates the attempt immediately; a Pod that still exists but has no runtime
+metadata continues waiting normally. Regression coverage in
+`src/tests/_internal/core/backends/runpod/test_compute.py` covers both states.
+
 ## Rebase and retirement
 
 Rebase from the exact upstream tag or commit, then inspect the runner payload

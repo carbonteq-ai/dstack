@@ -1,6 +1,7 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import gpuhunt
+import pytest
 from gpuhunt.providers.runpod import RunpodProvider
 
 from dstack._internal.core.backends.runpod.compute import (
@@ -8,6 +9,7 @@ from dstack._internal.core.backends.runpod.compute import (
     _RunpodLiveGPUProvider,
 )
 from dstack._internal.core.backends.runpod.models import RunpodAPIKeyCreds, RunpodConfig
+from dstack._internal.core.errors import ProvisioningError
 from dstack._internal.core.models.resources import ResourcesSpec
 from dstack._internal.core.models.runs import Requirements
 
@@ -105,3 +107,22 @@ def test_on_demand_offers_keep_using_offline_catalog():
 
     get_catalog_offers.assert_called_once()
     get_live_offers.assert_not_called()
+
+
+def test_absent_pod_fails_provisioning_immediately():
+    compute = RunpodCompute(RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret")))
+    compute.api_client.get_pod = MagicMock(return_value=None)
+    provisioning_data = MagicMock(instance_id="pod-1", hostname=None)
+
+    with pytest.raises(ProvisioningError, match="no longer exists during provisioning"):
+        compute.update_provisioning_data(provisioning_data, "public", "private")
+
+
+def test_pod_without_runtime_keeps_waiting_for_provisioning():
+    compute = RunpodCompute(RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret")))
+    compute.api_client.get_pod = MagicMock(return_value={"runtime": None})
+    provisioning_data = MagicMock(instance_id="pod-1", hostname=None)
+
+    compute.update_provisioning_data(provisioning_data, "public", "private")
+
+    assert provisioning_data.hostname is None

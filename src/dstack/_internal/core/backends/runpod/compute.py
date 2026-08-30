@@ -32,6 +32,7 @@ from dstack._internal.core.backends.runpod.models import RunpodConfig
 from dstack._internal.core.consts import DSTACK_RUNNER_SSH_PORT
 from dstack._internal.core.errors import (
     ComputeError,
+    ProvisioningError,
 )
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.common import CoreModel, RegistryAuth
@@ -395,7 +396,11 @@ class RunpodCompute(
     ):
         instance_id = provisioning_data.instance_id
         pod = self.api_client.get_pod(instance_id)
-        if pod is None or pod["runtime"] is None:
+        if pod is None:
+            raise ProvisioningError(
+                f"RunPod Pod {instance_id} no longer exists during provisioning"
+            )
+        if pod["runtime"] is None:
             return
         ports = pod["runtime"].get("ports")
         if ports is None:
