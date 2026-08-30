@@ -6,17 +6,16 @@ Published candidate branch. The working tree is based on upstream dstack
 `0.20.29` at commit `2f9618f4d521140350efd1b344412d122c1e0322`.
 `origin` points to `carbonteq-ai/dstack` and `upstream` points to
 `dstackai/dstack`. Consumers may pin only a published CarbonTeq commit by full
-SHA. Commit `6494f15c7a36a2cdb92cec2f9b33696adb143fef` is the currently qualified
-server/runner/shim release; its regional-failover successor still requires the
-same immutable release gate.
+SHA. Commit `a73c3314ab54cbe0e6056f6dad2e33e173596be6` is the currently qualified
+server/runner/shim release.
 
 Published branch `codex/registry-default-auth` adds the exact-host registry
 credential and live RunPod GPU-offer behavior below on top of commit
 `275b81bc725967c8925b5b12d96500dc60a45370`. The published pre-start regional
 failover implementation is commit `e9d74b0cfd330500879946141469313e46de2e7d`.
-The bounded retry-budget and region-cooldown implementation is local commit
-`deb3aafcd2706f98f7d43ba8ba975d7737e3bc6e`; it is not yet published or
-deployed.
+The bounded retry-budget, region-cooldown, and persisted managed-storage
+rotation implementation is published and deployed at commit
+`a73c3314ab54cbe0e6056f6dad2e33e173596be6`.
 
 ## Maintained delta
 
@@ -87,6 +86,15 @@ This keeps regional policy in infrastructure configuration while workload
 clients specify only resource, spot, and price requirements. Focused tests
 cover configuration validation, lowest-price selection, empty-volume rotation,
 post-provision pinning, row reuse, and the legacy fixed-region path.
+
+The submitted-job pipeline recognizes the exact run-owned mount after it has
+been persisted into the run specification; arbitrary user volumes still opt
+out. A no-capacity result can rotate only the regional volume that was active
+when that result was recorded, so a failure from the previous region cannot
+immediately evict its replacement. Live qualification on 2026-08-30 rotated an
+empty `CA-MTL-3` volume to `US-WA-1`, honored both ten-minute cooldowns, then
+recreated `CA-MTL-3` and made a fresh allocation attempt before responding to
+the new provider no-capacity result.
 
 ### Bound capacity admission and interruption recovery independently
 
