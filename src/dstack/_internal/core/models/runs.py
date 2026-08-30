@@ -82,6 +82,14 @@ class JobStatus(str, Enum):
 class Retry(CoreModel):
     on_events: List[RetryEvent]
     duration: int
+    duration_by_event: Dict[RetryEvent, int] = Field(default_factory=dict)
+    max_attempts_by_event: Dict[RetryEvent, int] = Field(default_factory=dict)
+
+    def duration_for(self, event: RetryEvent) -> int:
+        return self.duration_by_event.get(event, self.duration)
+
+    def max_attempts_for(self, event: RetryEvent) -> Optional[int]:
+        return self.max_attempts_by_event.get(event)
 
     def pretty_format(self) -> str:
         pretty_duration = format_pretty_duration(self.duration)

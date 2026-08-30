@@ -443,6 +443,77 @@ class TestJobSubmittedWorker:
 
         assert region == "US-KS-2"
 
+        now = get_current_datetime()
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.FAILED,
+            configuration=RunpodVolumeConfiguration(
+                name=f"run-{run.id.hex}",
+                region="US-KS-2",
+                size="10GB",
+                tags={"dstack-run-storage-failed-regions": f"us-ks-2:{int(now.timestamp())}"},
+            ),
+        )
+        volume.run_id = run.id
+        await session.commit()
+
+        with (
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+                new=AsyncMock(return_value=offers),
+            ),
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_current_datetime",
+                return_value=now + timedelta(minutes=9),
+            ),
+        ):
+            cooling_region = await _select_run_storage_region(
+                context,
+                RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+        assert cooling_region == "US-CA-2"
+
+        volume_configuration = RunpodVolumeConfiguration.parse_raw(volume.configuration)
+        assert volume_configuration.tags is not None
+        volume_configuration.tags["dstack-run-storage-failed-regions"] = (
+            f"us-ca-2:{int(now.timestamp())}+us-ks-2:{int(now.timestamp())}"
+        )
+        volume.configuration = volume_configuration.json()
+        await session.commit()
+        with (
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+                new=AsyncMock(return_value=offers),
+            ),
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_current_datetime",
+                return_value=now + timedelta(minutes=9),
+            ),
+        ):
+            no_region = await _select_run_storage_region(
+                context,
+                RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+        assert no_region is None
+
+        with (
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+                new=AsyncMock(return_value=offers),
+            ),
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_current_datetime",
+                return_value=now + timedelta(minutes=10, seconds=1),
+            ),
+        ):
+            eligible_again = await _select_run_storage_region(
+                context,
+                RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+        assert eligible_again == "US-KS-2"
+
     async def test_creates_one_managed_volume_for_runpod_spot_task(
         self, test_db, session: AsyncSession, worker: JobSubmittedWorker
     ):
@@ -553,10 +624,11 @@ class TestJobSubmittedWorker:
         await session.refresh(volume)
         assert volume.to_be_deleted
         failed_configuration = RunpodVolumeConfiguration.parse_raw(volume.configuration)
-        assert failed_configuration.tags == {
-            "dstack-run-id": str(run.id),
-            "dstack-run-storage-failed-regions": "us-ks-2",
-        }
+        assert failed_configuration.tags is not None
+        assert failed_configuration.tags["dstack-run-id"] == str(run.id)
+        assert failed_configuration.tags["dstack-run-storage-failed-regions"].startswith(
+            "us-ks-2:"
+        )
 
         volume.deleted = True
         await session.commit()
@@ -592,10 +664,11 @@ class TestJobSubmittedWorker:
         assert volume.status == VolumeStatus.SUBMITTED
         rotated_configuration = RunpodVolumeConfiguration.parse_raw(volume.configuration)
         assert rotated_configuration.region == "US-CA-2"
-        assert rotated_configuration.tags == {
-            "dstack-run-id": str(run.id),
-            "dstack-run-storage-failed-regions": "us-ks-2",
-        }
+        assert rotated_configuration.tags is not None
+        assert rotated_configuration.tags["dstack-run-id"] == str(run.id)
+        assert rotated_configuration.tags["dstack-run-storage-failed-regions"].startswith(
+            "us-ks-2:"
+        )
         volume_count = await session.scalar(
             select(func.count()).select_from(VolumeModel).where(VolumeModel.run_id == run.id)
         )
@@ -650,10 +723,11 @@ class TestJobSubmittedWorker:
         await session.refresh(volume)
         assert volume.to_be_deleted
         failed_configuration = RunpodVolumeConfiguration.parse_raw(volume.configuration)
-        assert failed_configuration.tags == {
-            "dstack-run-id": str(run.id),
-            "dstack-run-storage-failed-regions": "us-ca-2",
-        }
+        assert failed_configuration.tags is not None
+        assert failed_configuration.tags["dstack-run-id"] == str(run.id)
+        assert failed_configuration.tags["dstack-run-storage-failed-regions"].startswith(
+            "us-ca-2:"
+        )
 
     async def test_does_not_rotate_managed_volume_after_first_provisioning(
         self, test_db, session: AsyncSession

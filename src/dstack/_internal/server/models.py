@@ -442,6 +442,8 @@ class RunModel(PipelineModelMixin, BaseModel):
     """`resubmission_attempt` counts consecutive transitions to pending without provisioning.
     It can be used to choose a retry delay based on the attempt number.
     """
+    retry_state: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    """Compact event counters and first-event timestamps retained independently of job history."""
     run_spec: Mapped[str] = mapped_column(Text)
     service_spec: Mapped[Optional[str]] = mapped_column(Text)
     priority: Mapped[int] = mapped_column(Integer, default=0)

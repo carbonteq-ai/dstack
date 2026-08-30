@@ -54,6 +54,7 @@ class ActiveRunUpdateMap(ItemUpdateMap, total=False):
     resubmission_attempt: int
     desired_replica_count: int
     desired_replica_counts: Optional[str]  # JSON
+    retry_state: str
 
 
 class ActiveRunJobUpdateMap(ItemUpdateMap, total=False):
@@ -94,6 +95,8 @@ class _ReplicaAnalysis:
     """At least one job failed with a retryable reason and the retry duration hasn't been
     exceeded. When `True`, the replica does not contribute its statuses to the run-level
     analysis and is added to `replicas_to_retry` instead."""
+    retry_event: Optional[RetryEvent] = None
+    retry_duration: Optional[timedelta] = None
 
 
 @dataclass
@@ -110,6 +113,8 @@ class _RunAnalysis:
     termination_reasons: Set[RunTerminationReason] = field(default_factory=set)
     replicas_to_retry: List[Tuple[int, List[JobModel]]] = field(default_factory=list)
     """Replicas with retryable failures that haven't exceeded the retry duration."""
+    retry_events: List[Tuple[RetryEvent, timedelta]] = field(default_factory=list)
+    """One accepted retry event per replica recovery action."""
 
 
 @dataclass
@@ -126,7 +131,7 @@ async def process_active_run(context: ActiveContext) -> ActiveResult:
     analysis = await _analyze_active_run(run_model)
     transition = _get_active_run_transition(run_spec, run_model, analysis)
 
-    run_update_map = _build_run_update_map(run_model, run_spec, transition, fleet_id)
+    run_update_map = _build_run_update_map(run_model, run_spec, transition, fleet_id, analysis)
     new_job_models: list[JobModel] = []
     job_id_to_update_map: Dict[uuid.UUID, ActiveRunJobUpdateMap] = {}
 
@@ -199,6 +204,8 @@ async def _analyze_active_run_replica(
     contributed_statuses: Set[RunStatus] = set()
     termination_reasons: Set[RunTerminationReason] = set()
     needs_retry = False
+    retry_event: Optional[RetryEvent] = None
+    retry_duration: Optional[timedelta] = None
 
     for job_model in job_models:
         if _job_is_done_or_finishing_done(job_model):
@@ -214,15 +221,19 @@ async def _analyze_active_run_replica(
             continue
 
         if _job_needs_retry_evaluation(job_model):
-            current_duration = await _should_retry_job(run_model, job_model)
-            if current_duration is None:
+            retry_evaluation = await _should_retry_job(run_model, job_model)
+            if retry_evaluation is None:
                 contributed_statuses.add(RunStatus.FAILED)
                 termination_reasons.add(RunTerminationReason.JOB_FAILED)
-            elif _is_retry_duration_exceeded(job_model, current_duration):
+            elif _is_retry_limit_exceeded(
+                run_model, job_model, retry_evaluation[0], retry_evaluation[1]
+            ):
                 contributed_statuses.add(RunStatus.FAILED)
                 termination_reasons.add(RunTerminationReason.RETRY_LIMIT_EXCEEDED)
             else:
                 needs_retry = True
+                retry_event = retry_evaluation[0]
+                retry_duration = retry_evaluation[1]
             continue
 
         raise ServerError(f"Unexpected job status {job_model.status}")
@@ -233,6 +244,8 @@ async def _analyze_active_run_replica(
         contributed_statuses=contributed_statuses,
         termination_reasons=termination_reasons,
         needs_retry=needs_retry,
+        retry_event=retry_event,
+        retry_duration=retry_duration,
     )
 
 
@@ -248,6 +261,11 @@ def _apply_replica_analysis(
     if replica_analysis.needs_retry:
         analysis.replicas_to_retry.append(
             (replica_analysis.replica_num, replica_analysis.job_models)
+        )
+        assert replica_analysis.retry_event is not None
+        assert replica_analysis.retry_duration is not None
+        analysis.retry_events.append(
+            (replica_analysis.retry_event, replica_analysis.retry_duration)
         )
 
     if not replica_analysis.needs_retry:
@@ -286,16 +304,24 @@ def _job_needs_retry_evaluation(job_model: JobModel) -> bool:
 async def _should_retry_job(
     run_model: RunModel,
     job_model: JobModel,
-) -> Optional[timedelta]:
+) -> Optional[Tuple[RetryEvent, timedelta]]:
     """
-    Checks if the job should be retried and returns the elapsed retry duration.
+    Checks if the job should be retried and returns its event and elapsed budget.
 
-    For `no-capacity`, retry is limited by the age of the current run. Once the
-    job has already provisioned, retry is limited by the time since the latest
-    provisioned submission for that job.
+    `no-capacity` is anchored to initial submission. Provisioned retry events
+    are anchored to their compact first-event timestamp, or to the current
+    failed submission while that timestamp is being recorded.
     """
     job_spec = get_job_spec(job_model)
     if job_spec.retry is None:
+        return None
+
+    retry_event = (
+        job_model.termination_reason.to_retry_event()
+        if job_model.termination_reason is not None
+        else None
+    )
+    if retry_event is None or retry_event not in job_spec.retry.on_events:
         return None
 
     last_provisioned = await _load_last_provisioned_job(
@@ -304,26 +330,24 @@ async def _should_retry_job(
         job_num=job_model.job_num,
     )
 
-    if (
-        job_model.termination_reason is not None
-        and job_model.termination_reason.to_retry_event() == RetryEvent.NO_CAPACITY
-        and last_provisioned is None
-        and RetryEvent.NO_CAPACITY in job_spec.retry.on_events
-    ):
+    if retry_event == RetryEvent.NO_CAPACITY and last_provisioned is None:
         retry_started_at = run_model.submitted_at
         if run_model.next_triggered_at is not None:
             # Scheduled runs keep `next_triggered_at` pointing to the current trigger time while
             # retrying. Retryable failures go back to PENDING directly, and the terminating worker
             # advances `next_triggered_at` only when the current execution is over.
             retry_started_at = run_model.next_triggered_at
-        return get_current_datetime() - retry_started_at
+        return retry_event, get_current_datetime() - retry_started_at
 
-    if (
-        job_model.termination_reason is not None
-        and job_model.termination_reason.to_retry_event() in job_spec.retry.on_events
-        and last_provisioned is not None
-    ):
-        return get_current_datetime() - last_provisioned.last_processed_at
+    if last_provisioned is not None:
+        retry_state = _load_retry_state(run_model)
+        first_at = retry_state.get(retry_event.value, {}).get("first_at")
+        retry_started_at = (
+            datetime.fromisoformat(first_at)
+            if isinstance(first_at, str)
+            else job_model.last_processed_at
+        )
+        return retry_event, get_current_datetime() - retry_started_at
 
     return None
 
@@ -350,11 +374,42 @@ async def _load_last_provisioned_job(
         return res.scalar_one_or_none()
 
 
-def _is_retry_duration_exceeded(job_model: JobModel, current_duration: timedelta) -> bool:
+def _is_retry_limit_exceeded(
+    run_model: RunModel,
+    job_model: JobModel,
+    retry_event: RetryEvent,
+    current_duration: timedelta,
+) -> bool:
     job_spec = get_job_spec(job_model)
     if job_spec.retry is None:
         return True
-    return current_duration > timedelta(seconds=job_spec.retry.duration)
+    max_attempts = job_spec.retry.max_attempts_for(retry_event)
+    state = _load_retry_state(run_model).get(retry_event.value, {})
+    attempts = state.get("attempts", 0)
+    if max_attempts is not None and attempts >= max_attempts:
+        return True
+    return current_duration >= timedelta(seconds=job_spec.retry.duration_for(retry_event))
+
+
+def _load_retry_state(run_model: RunModel) -> Dict[str, dict]:
+    try:
+        state = json.loads(run_model.retry_state)
+    except (TypeError, ValueError):
+        logger.warning("Invalid retry state for run %s; rebuilding it", run_model.id)
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _record_retry_events(
+    run_model: RunModel, retry_events: List[Tuple[RetryEvent, timedelta]]
+) -> str:
+    state = _load_retry_state(run_model)
+    now = get_current_datetime()
+    for retry_event, retry_duration in retry_events:
+        event_state = state.setdefault(retry_event.value, {})
+        event_state["attempts"] = int(event_state.get("attempts", 0)) + 1
+        event_state.setdefault("first_at", (now - retry_duration).isoformat())
+    return json.dumps(state, separators=(",", ":"), sort_keys=True)
 
 
 def _should_stop_on_master_done(run_spec: RunSpec, run_model: RunModel) -> bool:
@@ -414,11 +469,15 @@ def _build_run_update_map(
     run_spec: RunSpec,
     transition: _ActiveRunTransition,
     fleet_id: Optional[uuid.UUID],
+    analysis: _RunAnalysis,
 ) -> ActiveRunUpdateMap:
     update_map = ActiveRunUpdateMap()
 
     if fleet_id != run_model.fleet_id:
         update_map["fleet_id"] = fleet_id
+
+    if analysis.retry_events:
+        update_map["retry_state"] = _record_retry_events(run_model, analysis.retry_events)
 
     if run_model.status == transition.new_status:
         return update_map

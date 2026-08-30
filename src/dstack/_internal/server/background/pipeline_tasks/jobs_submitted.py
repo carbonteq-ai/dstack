@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -161,6 +162,7 @@ from dstack._internal.utils.logging import get_logger
 logger = get_logger(__name__)
 
 _RUN_STORAGE_FAILED_REGIONS_TAG = "dstack-run-storage-failed-regions"
+_RUN_STORAGE_REGION_COOLDOWN = timedelta(minutes=10)
 
 
 @dataclass
@@ -1050,12 +1052,16 @@ async def _select_run_storage_region(
             select(VolumeModel).where(VolumeModel.run_id == context.run_model.id)
         )
     failed_regions = _get_run_storage_failed_regions(previous_volume)
-    untried_offers = [
-        offer for offer in eligible_offers if offer.region.lower() not in failed_regions
+    cooldown_cutoff = (
+        get_current_datetime().timestamp() - _RUN_STORAGE_REGION_COOLDOWN.total_seconds()
+    )
+    candidates = [
+        offer
+        for offer in eligible_offers
+        if failed_regions.get(offer.region.lower(), 0) <= cooldown_cutoff
     ]
-    # Once every currently advertised region has failed, begin a new bounded
-    # pass. This avoids permanently stranding a run when capacity later returns.
-    candidates = untried_offers or eligible_offers
+    if not candidates:
+        return None
     selected = min(
         candidates,
         key=lambda offer: (
@@ -1066,16 +1072,37 @@ async def _select_run_storage_region(
     return configured_regions[selected.region.lower()][1]
 
 
-def _get_run_storage_failed_regions(volume_model: Optional[VolumeModel]) -> set[str]:
+def _get_run_storage_failed_regions(volume_model: Optional[VolumeModel]) -> dict[str, float]:
     if volume_model is None:
-        return set()
-    configuration = RunpodVolumeConfiguration.parse_raw(volume_model.configuration)
-    tags = configuration.tags or {}
-    return {
-        region.strip().lower()
-        for region in tags.get(_RUN_STORAGE_FAILED_REGIONS_TAG, "").split(",")
-        if region.strip()
-    }
+        return {}
+    configuration = json.loads(volume_model.configuration)
+    tags = configuration.get("tags") or {}
+    if not isinstance(tags, dict):
+        return {}
+    failures: dict[str, float] = {}
+    for entry in tags.get(_RUN_STORAGE_FAILED_REGIONS_TAG, "").replace(",", "+").split("+"):
+        region, separator, failed_at = entry.strip().lower().partition(":")
+        if not region:
+            continue
+        try:
+            failures[region] = float(failed_at) if separator else 0
+        except ValueError:
+            failures[region] = 0
+    return failures
+
+
+def _format_run_storage_failed_regions(failures: dict[str, float]) -> str:
+    return "+".join(f"{region}:{int(failed_at)}" for region, failed_at in sorted(failures.items()))
+
+
+def _parse_runpod_volume_configuration(volume_model: VolumeModel) -> RunpodVolumeConfiguration:
+    raw_configuration = json.loads(volume_model.configuration)
+    tags = raw_configuration.get("tags")
+    if isinstance(tags, dict) and isinstance(tags.get(_RUN_STORAGE_FAILED_REGIONS_TAG), str):
+        tags[_RUN_STORAGE_FAILED_REGIONS_TAG] = tags[_RUN_STORAGE_FAILED_REGIONS_TAG].replace(
+            ",", "+"
+        )
+    return RunpodVolumeConfiguration.parse_obj(raw_configuration)
 
 
 async def _can_rotate_run_storage(
@@ -1126,12 +1153,17 @@ async def _apply_ensure_run_storage(
 
     volume_name = f"run-{context.run_model.id.hex}"
     mount = VolumeMountPoint(name=volume_name, path=configuration.path)
+    now = get_current_datetime()
     failed_regions = _get_run_storage_failed_regions(existing)
-    if region.lower() in failed_regions:
-        failed_regions.clear()
+    cooldown_cutoff = now.timestamp() - _RUN_STORAGE_REGION_COOLDOWN.total_seconds()
+    failed_regions = {
+        failed_region: failed_at
+        for failed_region, failed_at in failed_regions.items()
+        if failed_at > cooldown_cutoff and failed_region != region.lower()
+    }
     tags = {"dstack-run-id": str(context.run_model.id)}
     if failed_regions:
-        tags[_RUN_STORAGE_FAILED_REGIONS_TAG] = ",".join(sorted(failed_regions))
+        tags[_RUN_STORAGE_FAILED_REGIONS_TAG] = _format_run_storage_failed_regions(failed_regions)
     volume_configuration = RunpodVolumeConfiguration(
         name=volume_name,
         region=region,
@@ -1139,7 +1171,6 @@ async def _apply_ensure_run_storage(
         auto_cleanup_duration="off",
         tags=tags,
     )
-    now = get_current_datetime()
     if existing is None:
         volume_model = VolumeModel(
             id=uuid.uuid4(),
@@ -1235,11 +1266,11 @@ async def _apply_rotate_run_storage(
     if volume_model.status != VolumeStatus.FAILED and not no_capacity_failures:
         return
 
-    volume_configuration = RunpodVolumeConfiguration.parse_raw(volume_model.configuration)
+    volume_configuration = _parse_runpod_volume_configuration(volume_model)
     failed_regions = _get_run_storage_failed_regions(volume_model)
-    failed_regions.add(volume_configuration.region.lower())
+    failed_regions[volume_configuration.region.lower()] = get_current_datetime().timestamp()
     tags = dict(volume_configuration.tags or {})
-    tags[_RUN_STORAGE_FAILED_REGIONS_TAG] = ",".join(sorted(failed_regions))
+    tags[_RUN_STORAGE_FAILED_REGIONS_TAG] = _format_run_storage_failed_regions(failed_regions)
     volume_configuration.tags = tags
     volume_model.configuration = volume_configuration.json()
     volume_model.to_be_deleted = True

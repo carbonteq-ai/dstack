@@ -379,6 +379,7 @@ async def create_run(
     priority: int = 0,
     deployment_num: int = 0,
     resubmission_attempt: int = 0,
+    retry_state: str = "{}",
     next_triggered_at: Optional[datetime] = None,
     last_processed_at: Optional[datetime] = None,
 ) -> RunModel:
@@ -411,6 +412,7 @@ async def create_run(
         deployment_num=deployment_num,
         desired_replica_count=1,
         resubmission_attempt=resubmission_attempt,
+        retry_state=retry_state,
         next_triggered_at=next_triggered_at,
         gateway=gateway,
     )
