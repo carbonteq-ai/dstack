@@ -14,6 +14,9 @@ Published branch `codex/registry-default-auth` adds the exact-host registry
 credential and live RunPod GPU-offer behavior below on top of commit
 `275b81bc725967c8925b5b12d96500dc60a45370`. The published pre-start regional
 failover implementation is commit `e9d74b0cfd330500879946141469313e46de2e7d`.
+The bounded retry-budget and region-cooldown implementation is local commit
+`deb3aafcd2706f98f7d43ba8ba975d7737e3bc6e`; it is not yet published or
+deployed.
 
 ## Maintained delta
 
@@ -76,13 +79,37 @@ deletes the still-empty managed volume through the existing volume pipeline,
 and reuses its logical volume row in the next-cheapest eligible region. Once
 any job submission has provisioning data or the volume has an attachment,
 regional rotation is forbidden and every interruption retry remains pinned to
-the checkpoint-bearing volume. After all currently advertised regions have
-been tried, selection begins a new bounded pass so later capacity can recover.
+the checkpoint-bearing volume. Each failed region enters a ten-minute
+cooldown. If every eligible region is cooling down, the submission remains
+pending; expired regions become eligible again and are compared by live price.
 
 This keeps regional policy in infrastructure configuration while workload
 clients specify only resource, spot, and price requirements. Focused tests
 cover configuration validation, lowest-price selection, empty-volume rotation,
 post-provision pinning, row reuse, and the legacy fixed-region path.
+
+### Bound capacity admission and interruption recovery independently
+
+The upstream retry profile has one duration for all retry events and measures
+interruption time from the latest provisioned submission. A successful spot
+replacement therefore resets the interruption clock, while deleted historical
+submissions can erase useful attempt evidence.
+
+The candidate keeps the existing `duration` field as a compatibility fallback
+and adds optional `duration_by_event` and `max_attempts_by_event` maps. Accepted
+retry actions update a compact `runs.retry_state` record containing each
+event's total attempts and first-event timestamp. The state is independent of
+job-submission retention. Posttrain configures:
+
+- `no-capacity`: 24 hours from initial submission;
+- `interruption`: two hours from the first interruption, never reset;
+- at most five interruption recoveries; and
+- no retry for arbitrary workload errors.
+
+Pending resubmissions retain the upstream exponential sequence (15 seconds,
+30 seconds, one minute, two minutes, five minutes, then a ten-minute base cap)
+and apply stable per-run, per-attempt jitter in the range of minus to plus 20
+percent. Stable jitter prevents a polling cycle from moving its own deadline.
 
 ### Keep environment values out of diagnostic logs
 
@@ -227,6 +254,14 @@ submitted/running pipeline files produced 106 passes, 110 PostgreSQL skips,
 and eight SQLite failures in unrelated multinode placeholder, cluster-lock,
 and placement-group expectations. Re-run those gates in the pinned release
 environment before publication; they are not represented as passing here.
+
+The retry-budget and regional-cooldown successor passes 15 focused retry and
+managed-storage tests with 14 PostgreSQL variants skipped, 36 profile/run-spec
+compatibility tests with six PostgreSQL variants skipped, and the SQLite
+migration test. The broader run/submitted pipeline has 94 passes, 101
+PostgreSQL skips, and exactly the same eight unrelated SQLite multinode and
+placement failures. No production or provider canary was run for this policy
+follow-up.
 
 Before publication, repeat the Python suite with PostgreSQL enabled, build the
 server and both binaries from the immutable candidate commit, and run a live
