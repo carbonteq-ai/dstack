@@ -253,6 +253,8 @@ class RunpodCompute(
             dockerized=False,
             ssh_proxy=None,
             backend_data=None,
+            provisioning_timeout_seconds=self.config.provisioning_timeout_seconds,
+            provisioning_started_at=get_current_datetime(),
         )
 
     def run_jobs(
@@ -348,6 +350,8 @@ class RunpodCompute(
                 price=instance_offer.price,
                 username="root",
                 dockerized=False,
+                provisioning_timeout_seconds=self.config.provisioning_timeout_seconds,
+                provisioning_started_at=get_current_datetime(),
             )
             for pod in resp["pods"]
         ]

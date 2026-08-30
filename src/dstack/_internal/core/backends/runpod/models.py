@@ -38,6 +38,17 @@ class RunpodBackendConfig(CoreModel):
         ),
     ] = None
     provisioning_precondition: Optional[HTTPImageReadinessConfig] = None
+    provisioning_timeout_seconds: Annotated[
+        Optional[int],
+        Field(
+            ge=600,
+            le=3600,
+            description=(
+                "Maximum time from Pod creation until the runner is ready, including "
+                "container image pull and unpack. Omit to use the server default"
+            ),
+        ),
+    ] = None
 
 
 class RunpodBackendConfigWithCreds(RunpodBackendConfig):

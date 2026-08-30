@@ -53,7 +53,10 @@ from dstack._internal.server.background.pipeline_tasks.base import (
     set_processed_update_map_fields,
     set_unlock_update_map_fields,
 )
-from dstack._internal.server.background.pipeline_tasks.common import get_provisioning_timeout
+from dstack._internal.server.background.pipeline_tasks.common import (
+    get_provisioning_age,
+    get_provisioning_timeout,
+)
 from dstack._internal.server.db import get_db, get_session_ctx
 from dstack._internal.server.models import (
     ExportedFleetModel,
@@ -833,15 +836,21 @@ async def _process_provisioning_status(
     provisioning_timeout = get_provisioning_timeout(
         backend_type=job_provisioning_data.get_base_backend(),
         instance_type_name=job_provisioning_data.instance_type.name,
+        configured_seconds=job_provisioning_data.provisioning_timeout_seconds,
     )
-    if context.job_submission.age > provisioning_timeout:
+    provisioning_age = get_provisioning_age(
+        submitted_at=context.job_submission.submitted_at,
+        provisioning_started_at=job_provisioning_data.provisioning_started_at,
+        now=get_current_datetime(),
+    )
+    if provisioning_age > provisioning_timeout:
         _terminate_job(
             job_model=context.job_model,
             job_update_map=result.job_update_map,
             termination_reason=JobTerminationReason.WAITING_RUNNER_LIMIT_EXCEEDED,
             termination_reason_message=(
                 f"Runner did not become available within {provisioning_timeout.total_seconds()}s."
-                f" Job submission age: {context.job_submission.age.total_seconds()}s)"
+                f" Provisioning age: {provisioning_age.total_seconds()}s)"
             ),
         )
 

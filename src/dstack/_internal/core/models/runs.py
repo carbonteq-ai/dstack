@@ -337,6 +337,10 @@ class JobProvisioningData(CoreModel):
     ssh_proxy: Optional[SSHConnectionParams] = None
     backend_data: Optional[str] = None
     """`backend_data` stores backend-specific data in JSON."""
+    provisioning_timeout_seconds: Optional[int] = None
+    """Provider-selected runner readiness timeout persisted for restart-safe processing."""
+    provisioning_started_at: Optional[datetime] = None
+    """Provider resource creation time, excluding any pre-create readiness wait."""
 
     def get_base_backend(self) -> BackendType:
         if self.base_backend is not None:

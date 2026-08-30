@@ -175,6 +175,9 @@ The published exact-host credential delta additionally passes 38 focused
 Docker-default and job-service tests plus Ruff and `git diff --check`.
 The published RunPod live-offer delta passes all seven RunPod backend tests,
 including its three new compute tests, plus Ruff and `git diff --check`.
+The provisioning-timeout successor passes twelve focused RunPod configuration and
+timeout tests plus Ruff; the broader submitted-job run retains its eight known
+SQLite multinode/placement failures and adds no new failure.
 Resolving a fresh unpinned dev environment and running the two broader
 submitted/running pipeline files produced 106 passes, 110 PostgreSQL skips,
 and eight SQLite failures in unrelated multinode placeholder, cluster-lock,
@@ -211,6 +214,25 @@ configuration, digest validation, pending and verified responses, restart via
 the persisted snapshot, timeout, config mismatch, authorization rejection,
 secret non-disclosure, and a pipeline proof that provider `run_job` remains
 uncalled until the exact digest is verified.
+
+### Make container provisioning timeout backend-configurable
+
+RunPod pulls and unpacks the job image before dstack can reach its runner. The
+upstream fixed 20-minute RunPod provisioning timeout is too short for the first
+cold pull of the qualified 9 GB actual-job image, even though the provider Pod
+and registry remain healthy.
+
+The candidate adds an optional bounded `provisioning_timeout_seconds` RunPod
+backend setting and persists its resolved value plus the provider-create time
+in `JobProvisioningData` when the Pod is created. Both instance and job
+readiness deadlines consume that persisted value, so a server restart cannot
+silently revert an in-flight Pod to the default. Measuring from provider create
+also prevents a pre-create image-readiness wait from consuming the pull budget.
+Legacy attempts without the timestamp keep submission-time behavior. Omitting
+the setting preserves the existing 20-minute timeout; configured values are
+restricted to 10 through 60 minutes. Focused tests cover the bounds, public
+non-secret configuration round trip, unchanged default, 30-minute override,
+readiness-wait exclusion, and legacy fallback.
 
 ## Rebase and retirement
 

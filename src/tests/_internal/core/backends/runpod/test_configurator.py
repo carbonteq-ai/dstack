@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from dstack._internal.core.backends.runpod.configurator import RunpodConfigurator
 from dstack._internal.core.backends.runpod.models import RunpodBackendConfigWithCreds, RunpodCreds
@@ -12,6 +13,33 @@ from dstack._internal.core.models.provisioning_preconditions import (
 
 
 class TestRunpodConfigurator:
+    @pytest.mark.parametrize("value", [599, 3601])
+    def test_provisioning_timeout_is_bounded(self, value: int):
+        with pytest.raises(ValidationError):
+            RunpodBackendConfigWithCreds(
+                creds=RunpodCreds(api_key="valid"),
+                provisioning_timeout_seconds=value,
+            )
+
+    def test_provisioning_timeout_is_retained_in_public_config(self):
+        config = RunpodBackendConfigWithCreds(
+            creds=RunpodCreds(api_key="valid"),
+            provisioning_timeout_seconds=1800,
+        )
+        configurator = RunpodConfigurator()
+        with patch(
+            "dstack._internal.core.backends.runpod.api_client.RunpodApiClient.validate_api_key",
+            return_value=True,
+        ):
+            configurator.validate_config(config, default_creds_enabled=True)
+        record = configurator.create_backend("project", config)
+
+        public = configurator.get_backend_config_without_creds(record)
+        backend = configurator.get_backend(record)
+
+        assert public.provisioning_timeout_seconds == 1800
+        assert backend.config.provisioning_timeout_seconds == 1800
+
     def test_validate_config_valid(self):
         config = RunpodBackendConfigWithCreds(
             creds=RunpodCreds(api_key="valid"),
