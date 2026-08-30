@@ -1625,6 +1625,13 @@ class TestJobRunningWorker:
         worker: JobRunningWorker,
     ):
         project = await create_project(session=session)
+        await create_backend(
+            session=session,
+            project_id=project.id,
+            backend_type=BackendType.RUNPOD,
+            config={},
+            auth={"type": "api_key", "api_key": "test-api-key"},
+        )
         user = await create_user(session=session)
         repo = await create_repo(session=session, project_id=project.id)
         run = await create_run(session=session, project=project, repo=repo, user=user)
@@ -1649,12 +1656,17 @@ class TestJobRunningWorker:
         backend = Mock()
         backend.compute.return_value.is_instance_present.return_value = False
 
+        async def get_backend(project, backend_type):
+            assert len(project.backends) == 1
+            assert backend_type == BackendType.RUNPOD
+            return backend
+
         with (
             patch("dstack._internal.server.services.runner.pool.SSHTunnel") as ssh_tunnel_cls,
             patch(
                 "dstack._internal.server.background.pipeline_tasks.jobs_running."
                 "backends_services.get_project_backend_by_type",
-                new=AsyncMock(return_value=backend),
+                new=AsyncMock(side_effect=get_backend),
             ),
         ):
             ssh_tunnel_cls.side_effect = SSHError

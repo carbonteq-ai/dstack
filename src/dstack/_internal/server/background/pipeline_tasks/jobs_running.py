@@ -1169,10 +1169,18 @@ async def _provider_confirms_spot_instance_absent(
 ) -> bool:
     if not job_provisioning_data.instance_type.resources.spot:
         return False
-    backend = await backends_services.get_project_backend_by_type(
-        project=context.project,
-        backend_type=job_provisioning_data.get_base_backend(),
-    )
+    async with get_session_ctx() as session:
+        project = await session.scalar(
+            select(ProjectModel)
+            .where(ProjectModel.id == context.project.id)
+            .options(joinedload(ProjectModel.backends))
+        )
+        if project is None:
+            return False
+        backend = await backends_services.get_project_backend_by_type(
+            project=project,
+            backend_type=job_provisioning_data.get_base_backend(),
+        )
     if backend is None:
         return False
     try:
