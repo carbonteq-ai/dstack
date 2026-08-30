@@ -109,6 +109,15 @@ def test_on_demand_offers_keep_using_offline_catalog():
     get_live_offers.assert_not_called()
 
 
+@pytest.mark.parametrize(("pod", "expected"), [({"id": "pod-1"}, True), (None, False)])
+def test_instance_presence_comes_from_runpod(pod, expected):
+    compute = RunpodCompute(RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret")))
+    compute.api_client.get_pod = MagicMock(return_value=pod)
+
+    assert compute.is_instance_present("pod-1", "US-WA-1") is expected
+    compute.api_client.get_pod.assert_called_once_with("pod-1")
+
+
 def test_absent_pod_fails_provisioning_immediately():
     compute = RunpodCompute(RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret")))
     compute.api_client.get_pod = MagicMock(return_value=None)

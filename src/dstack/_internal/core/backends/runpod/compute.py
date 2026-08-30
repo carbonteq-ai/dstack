@@ -258,6 +258,14 @@ class RunpodCompute(
             provisioning_started_at=get_current_datetime(),
         )
 
+    def is_instance_present(
+        self,
+        instance_id: str,
+        region: str,
+        backend_data: Optional[str] = None,
+    ) -> Optional[bool]:
+        return self.api_client.get_pod(instance_id) is not None
+
     def run_jobs(
         self,
         run: Run,

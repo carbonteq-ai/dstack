@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -25,6 +25,7 @@ from dstack._internal.core.models.profiles import (
     InstanceNameSelector,
     InstanceSelector,
     Profile,
+    SpotPolicy,
 )
 from dstack._internal.core.models.provisioning_preconditions import (
     HTTPBearerCredentials,
@@ -55,11 +56,14 @@ from dstack._internal.server.models import (
     JobModel,
     PlacementGroupModel,
     VolumeAttachmentModel,
+    VolumeModel,
 )
 from dstack._internal.server.services.docker import ImageConfig
 from dstack._internal.server.services.jobs.configurators.base import JobConfigurator
+from dstack._internal.server.services.runs import get_run_spec as get_persisted_run_spec
 from dstack._internal.server.testing.common import (
     ComputeMockSpec,
+    create_backend,
     create_export,
     create_fleet,
     create_instance,
@@ -374,6 +378,60 @@ class TestJobSubmittedFetcher:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
 class TestJobSubmittedWorker:
+    async def test_creates_one_managed_volume_for_runpod_spot_task(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        await create_backend(
+            session=session,
+            project_id=project.id,
+            backend_type=BackendType.RUNPOD,
+            config={
+                "run_storage": {
+                    "region": "US-WA-1",
+                    "size": "10GB",
+                    "path": "/workspace",
+                }
+            },
+            auth={"type": "api_key", "api_key": "test-api-key"},
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=get_run_spec(
+                repo_id=repo.name,
+                configuration=TaskConfiguration(image="debian", nodes=1),
+                profile=Profile(spot_policy=SpotPolicy.SPOT),
+            ),
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        volumes = list(
+            (await session.execute(select(VolumeModel).where(VolumeModel.run_id == run.id)))
+            .scalars()
+            .all()
+        )
+        assert len(volumes) == 1
+        assert volumes[0].status == VolumeStatus.SUBMITTED
+        assert volumes[0].name == f"run-{run.id.hex}"
+        await session.refresh(run)
+        run_spec = get_persisted_run_spec(run)
+        assert run_spec.configuration.volumes == [
+            VolumeMountPoint(name=volumes[0].name, path="/workspace")
+        ]
+
+        await _process_job(session=session, worker=worker, job_model=job)
+        volume_count = await session.scalar(
+            select(func.count()).select_from(VolumeModel).where(VolumeModel.run_id == run.id)
+        )
+        assert volume_count == 1
+
     async def test_provisions_assigned_job_on_existing_instance(
         self, test_db, session: AsyncSession, worker: JobSubmittedWorker
     ):

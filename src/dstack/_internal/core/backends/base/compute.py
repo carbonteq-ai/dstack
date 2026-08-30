@@ -153,6 +153,19 @@ class Compute(ABC):
         """
         pass
 
+    def is_instance_present(
+        self,
+        instance_id: str,
+        region: str,
+        backend_data: Optional[str] = None,
+    ) -> Optional[bool]:
+        """Return provider presence when the backend can observe it authoritatively.
+
+        ``None`` keeps the existing transport-based reachability fallback for
+        backends that do not implement provider observation.
+        """
+        return None
+
     def update_provisioning_data(
         self,
         provisioning_data: JobProvisioningData,

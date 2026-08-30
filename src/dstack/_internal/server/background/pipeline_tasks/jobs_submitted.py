@@ -20,7 +20,10 @@ from dstack._internal.core.backends.features import (
     BACKENDS_WITH_GROUP_PROVISIONING_SUPPORT,
     BACKENDS_WITH_PLACEMENT_GROUPS_SUPPORT,
 )
+from dstack._internal.core.backends.runpod.backend import RunpodBackend
+from dstack._internal.core.backends.runpod.models import RunpodRunStorageConfig
 from dstack._internal.core.errors import BackendError, ServerClientError, SkipOffer
+from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.common import NetworkMode
 from dstack._internal.core.models.compute_groups import (
     ComputeGroupProvisioningData,
@@ -38,6 +41,7 @@ from dstack._internal.core.models.profiles import (
     DEFAULT_RUN_TERMINATION_IDLE_TIME,
     CreationPolicy,
     Profile,
+    SpotPolicy,
     TerminationPolicy,
 )
 from dstack._internal.core.models.provisioning_preconditions import ImageReadinessSnapshot
@@ -51,7 +55,12 @@ from dstack._internal.core.models.runs import (
     Requirements,
     Run,
 )
-from dstack._internal.core.models.volumes import Volume
+from dstack._internal.core.models.volumes import (
+    RunpodVolumeConfiguration,
+    Volume,
+    VolumeMountPoint,
+    VolumeStatus,
+)
 from dstack._internal.core.services.profiles import get_termination
 from dstack._internal.server import settings
 from dstack._internal.server.background.pipeline_tasks.base import (
@@ -83,7 +92,10 @@ from dstack._internal.server.models import (
     VolumeModel,
 )
 from dstack._internal.server.services import events
-from dstack._internal.server.services.backends import get_project_backend_by_type_or_error
+from dstack._internal.server.services.backends import (
+    get_project_backend_by_type,
+    get_project_backend_by_type_or_error,
+)
 from dstack._internal.server.services.docker import apply_server_docker_defaults
 from dstack._internal.server.services.fleets import (
     can_create_new_cloud_instance_in_fleet,
@@ -127,7 +139,7 @@ from dstack._internal.server.services.placement import (
     placement_group_model_to_placement_group_optional,
     schedule_fleet_placement_groups_deletion,
 )
-from dstack._internal.server.services.runs import run_model_to_run
+from dstack._internal.server.services.runs import get_run_spec, run_model_to_run
 from dstack._internal.server.services.runs.plan import (
     find_optimal_fleet_with_offers,
     get_instance_offers_in_fleet,
@@ -332,6 +344,7 @@ class JobSubmittedWorker(Worker[JobSubmittedPipelineItem]):
             )
             await _apply_provisioning_result(
                 item=item,
+                context=context,
                 provisioning=provisioning,
             )
             self._pipeline_hinter.hint_fetch(JobModel.__name__)
@@ -383,6 +396,11 @@ class _DeferSubmittedJobResult:
 
     log_message: str
     hint_fleet_pipeline: bool = False
+
+
+@dataclass
+class _EnsureRunStorageResult:
+    configuration: RunpodRunStorageConfig
 
 
 @dataclass
@@ -441,6 +459,7 @@ class _NewCapacityAssignment:
 
 _AssignmentResult = Union[
     _DeferSubmittedJobResult,
+    _EnsureRunStorageResult,
     _TerminateSubmittedJobResult,
     _NoFleetAssignment,
     _NewCapacityAssignment,
@@ -486,6 +505,7 @@ class _NewCapacityProvisioning:
 
 _ProvisioningResult = Union[
     _DeferSubmittedJobResult,
+    _EnsureRunStorageResult,
     _TerminateSubmittedJobResult,
     _RetrySubmittedJobResult,
     _ExistingInstanceProvisioning,
@@ -600,6 +620,20 @@ async def _apply_assignment_result(
                 session=session,
                 job_model=job_model,
                 log_message=assignment.log_message,
+            )
+            return
+
+        if isinstance(assignment, _EnsureRunStorageResult):
+            await _apply_ensure_run_storage(
+                session=session,
+                context=context,
+                job_model=job_model,
+                configuration=assignment.configuration,
+            )
+            await _defer_submitted_job(
+                session=session,
+                job_model=job_model,
+                log_message="created managed run storage",
             )
             return
 
@@ -872,6 +906,7 @@ async def _process_preconditions(
 ) -> Union[
     _ProcessedPreconditions,
     _DeferSubmittedJobResult,
+    _EnsureRunStorageResult,
     _TerminateSubmittedJobResult,
 ]:
     master_job_provisioning_data = _get_master_job_provisioning_data(context=context)
@@ -883,6 +918,25 @@ async def _process_preconditions(
             log_message="waiting for the run to be assigned to the fleet"
         )
 
+    run_storage = await _get_required_run_storage(context)
+    if run_storage is not None:
+        async with get_session_ctx() as session:
+            owned_volume = await session.scalar(
+                select(VolumeModel).where(
+                    VolumeModel.run_id == context.run_model.id,
+                    VolumeModel.deleted == False,
+                )
+            )
+        if owned_volume is None:
+            return _EnsureRunStorageResult(configuration=run_storage)
+        if owned_volume.status == VolumeStatus.FAILED:
+            return _TerminateSubmittedJobResult(
+                reason=JobTerminationReason.VOLUME_ERROR,
+                message=f"Run storage {owned_volume.name} failed: {owned_volume.status_message}",
+            )
+        if owned_volume.status != VolumeStatus.ACTIVE:
+            return _DeferSubmittedJobResult(log_message="waiting for run storage")
+
     prepared_job_volumes = await _prepare_job_volumes(context=context)
     if isinstance(prepared_job_volumes, _TerminateSubmittedJobResult):
         return prepared_job_volumes
@@ -890,6 +944,89 @@ async def _process_preconditions(
     return _ProcessedPreconditions(
         master_job_provisioning_data=master_job_provisioning_data,
         prepared_job_volumes=prepared_job_volumes,
+    )
+
+
+async def _get_required_run_storage(
+    context: _SubmittedJobContext,
+) -> Optional[RunpodRunStorageConfig]:
+    configuration = context.run.run_spec.configuration
+    if configuration.type != "task" or configuration.nodes != 1:
+        return None
+    if configuration.volumes:
+        return None
+    if context.run.run_spec.merged_profile.spot_policy != SpotPolicy.SPOT:
+        return None
+    backend = await get_project_backend_by_type(
+        project=context.project,
+        backend_type=BackendType.RUNPOD,
+    )
+    if not isinstance(backend, RunpodBackend):
+        return None
+    return backend.config.run_storage
+
+
+async def _apply_ensure_run_storage(
+    session: AsyncSession,
+    context: _SubmittedJobContext,
+    job_model: JobModel,
+    configuration: RunpodRunStorageConfig,
+) -> None:
+    existing = await session.scalar(
+        select(VolumeModel).where(
+            VolumeModel.run_id == context.run_model.id,
+            VolumeModel.deleted == False,
+        )
+    )
+    if existing is not None:
+        return
+
+    volume_name = f"run-{context.run_model.id.hex}"
+    mount = VolumeMountPoint(name=volume_name, path=configuration.path)
+    volume_configuration = RunpodVolumeConfiguration(
+        name=volume_name,
+        region=configuration.region,
+        size=configuration.size,
+        auto_cleanup_duration="off",
+        tags={"dstack-run-id": str(context.run_model.id)},
+    )
+    now = get_current_datetime()
+    volume_model = VolumeModel(
+        id=uuid.uuid4(),
+        name=volume_name,
+        user_id=context.run_model.user_id,
+        project_id=context.project.id,
+        run_id=context.run_model.id,
+        status=VolumeStatus.SUBMITTED,
+        configuration=volume_configuration.json(),
+        auto_cleanup_enabled=False,
+        attachments=[],
+        created_at=now,
+        last_processed_at=now,
+    )
+    session.add(volume_model)
+
+    run_model = await session.get(RunModel, context.run_model.id)
+    assert run_model is not None
+    run_spec = get_run_spec(run_model)
+    run_spec.configuration.volumes = [mount]
+    run_model.run_spec = run_spec.json()
+
+    job_models = list(
+        (await session.execute(select(JobModel).where(JobModel.run_id == context.run_model.id)))
+        .scalars()
+        .all()
+    )
+    for persisted_job_model in job_models:
+        job_spec = get_job_spec(persisted_job_model)
+        job_spec.volumes = [mount]
+        persisted_job_model.job_spec_data = job_spec.json()
+
+    events.emit(
+        session,
+        "Managed run storage created. Status: SUBMITTED",
+        actor=events.SystemActor(),
+        targets=[events.Target.from_model(volume_model), events.Target.from_model(run_model)],
     )
 
 
@@ -1264,6 +1401,7 @@ async def _process_provisioning(
 
 async def _apply_provisioning_result(
     item: JobSubmittedPipelineItem,
+    context: _SubmittedJobContext,
     provisioning: _ProvisioningResult,
 ) -> None:
     async with get_session_ctx() as session:
@@ -1294,6 +1432,20 @@ async def _apply_provisioning_result(
                 session=session,
                 job_model=job_model,
                 log_message=provisioning.log_message,
+            )
+            return
+
+        if isinstance(provisioning, _EnsureRunStorageResult):
+            await _apply_ensure_run_storage(
+                session=session,
+                context=context,
+                job_model=job_model,
+                configuration=provisioning.configuration,
+            )
+            await _defer_submitted_job(
+                session=session,
+                job_model=job_model,
+                log_message="created managed run storage",
             )
             return
 
@@ -2174,6 +2326,9 @@ def _hint_pipelines_fetch(
     pipeline_hinter: PipelineHinterProtocol,
     result: Union[_AssignmentResult, _ProvisioningResult],
 ) -> None:
+    if isinstance(result, _EnsureRunStorageResult):
+        pipeline_hinter.hint_fetch(VolumeModel.__name__)
+        return
     if not isinstance(result, _DeferSubmittedJobResult):
         return
 

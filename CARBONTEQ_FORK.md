@@ -247,6 +247,39 @@ terminates the attempt immediately; a Pod that still exists but has no runtime
 metadata continues waiting normally. Regression coverage in
 `src/tests/_internal/core/backends/runpod/test_compute.py` covers both states.
 
+### Treat provider-side Pod disappearance as authoritative while running
+
+Runner transport failure is ambiguous for most backends, but a missing RunPod
+Pod is authoritative for an interruptible attempt. After runner communication
+fails, the running-job pipeline now asks the RunPod backend whether the Pod is
+still present. Confirmed absence immediately classifies the attempt as an
+interruption so the existing logical-run retry policy can proceed; provider API
+errors and backends without authoritative observation retain the existing
+transport timeout. The provider query is limited to spot attempts.
+
+Regression coverage proves immediate interruption for confirmed absence and
+preserves the fallback for all other backends.
+
+### Own one managed network volume per RunPod spot run
+
+RunPod backend configuration may opt single-node spot tasks into `run_storage`
+with one Secure Cloud region, size, and mount path. Dstack creates one managed
+network volume owned by the logical run, persists the generated mount in the
+run and job specifications, and therefore reuses the same provider volume for
+every retry. A unique nullable `volumes.run_id` is the ownership fence; explicit
+volumes, on-demand jobs, services, multinode tasks, and other providers retain
+their existing behavior.
+
+When the logical run reaches a final status, dstack marks its owned volume for
+the existing volume deletion pipeline. Provider deletion failures now remain
+retryable and no longer emit a false `Volume deleted` event or set `deleted_at`.
+The existing persisted volume row plus its terminal event is the cleanup
+receipt, so this adds no second controller or cleanup ledger.
+
+Focused RunPod configuration, running-job, submitted-job, run-termination, and
+volume-deletion tests pass. The SQLite migration was exercised from an empty
+database through head and back to its predecessor.
+
 ## Rebase and retirement
 
 Rebase from the exact upstream tag or commit, then inspect the runner payload

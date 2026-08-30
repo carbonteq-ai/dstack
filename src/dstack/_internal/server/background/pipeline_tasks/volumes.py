@@ -274,7 +274,7 @@ async def _apply_process_result(
                 # TODO: Clean up volume.
                 pass
             return
-        if item.to_be_deleted:
+        if item.to_be_deleted and update_map.get("deleted"):
             events.emit(
                 session,
                 "Volume deleted",
@@ -389,12 +389,11 @@ async def _process_to_be_deleted_volume(volume_model: VolumeModel) -> _ProcessRe
             backend_type=volume.provisioning_data.backend,
         )
     except BackendNotAvailable:
-        # TODO: Retry deletion
         logger.error(
             f"Failed to delete volume {volume_model.name}. Backend {volume.configuration.backend} not available."
-            " Please terminate it manually to avoid unexpected charges.",
+            " Will retry deletion.",
         )
-        return _get_deleted_result()
+        return _ProcessResult()
 
     compute = backend.compute()
     assert isinstance(compute, ComputeWithVolumeSupport)
@@ -404,11 +403,11 @@ async def _process_to_be_deleted_volume(volume_model: VolumeModel) -> _ProcessRe
             volume=volume,
         )
     except Exception:
-        # TODO: Retry deletion
         logger.exception(
-            "Got exception when deleting volume %s. Please terminate it manually to avoid unexpected charges.",
+            "Got exception when deleting volume %s. Will retry deletion.",
             volume.name,
         )
+        return _ProcessResult()
     return _get_deleted_result()
 
 

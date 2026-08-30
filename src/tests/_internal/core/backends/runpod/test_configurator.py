@@ -4,7 +4,11 @@ import pytest
 from pydantic import ValidationError
 
 from dstack._internal.core.backends.runpod.configurator import RunpodConfigurator
-from dstack._internal.core.backends.runpod.models import RunpodBackendConfigWithCreds, RunpodCreds
+from dstack._internal.core.backends.runpod.models import (
+    RunpodBackendConfigWithCreds,
+    RunpodCreds,
+    RunpodRunStorageConfig,
+)
 from dstack._internal.core.errors import BackendInvalidCredentialsError, ConfigurationError
 from dstack._internal.core.models.provisioning_preconditions import (
     HTTPBearerCredentials,
@@ -13,6 +17,39 @@ from dstack._internal.core.models.provisioning_preconditions import (
 
 
 class TestRunpodConfigurator:
+    @pytest.mark.parametrize(
+        ("kwargs"),
+        [
+            {"region": "US", "size": "10GB", "path": "/workspace"},
+            {"region": "US-WA-1", "size": "9GB", "path": "/workspace"},
+            {"region": "US-WA-1", "size": "10GB", "path": "workspace"},
+        ],
+    )
+    def test_run_storage_rejects_unsupported_provider_settings(self, kwargs):
+        with pytest.raises(ValidationError):
+            RunpodRunStorageConfig(**kwargs)
+
+    def test_run_storage_is_retained_in_public_and_runtime_config(self):
+        run_storage = RunpodRunStorageConfig(
+            region="US-WA-1",
+            size="10GB",
+            path="/workspace",
+        )
+        config = RunpodBackendConfigWithCreds(
+            creds=RunpodCreds(api_key="valid"),
+            run_storage=run_storage,
+        )
+        configurator = RunpodConfigurator()
+        with patch(
+            "dstack._internal.core.backends.runpod.api_client.RunpodApiClient.validate_api_key",
+            return_value=True,
+        ):
+            configurator.validate_config(config, default_creds_enabled=True)
+        record = configurator.create_backend("project", config)
+
+        assert configurator.get_backend_config_without_creds(record).run_storage == run_storage
+        assert configurator.get_backend(record).config.run_storage == run_storage
+
     @pytest.mark.parametrize("value", [599, 3601])
     def test_provisioning_timeout_is_bounded(self, value: int):
         with pytest.raises(ValidationError):

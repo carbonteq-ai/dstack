@@ -1,6 +1,6 @@
 from typing import Annotated, List, Literal, Optional, Union
 
-from pydantic import Field
+from pydantic import Field, validator
 
 from dstack._internal.core.models.common import CoreModel
 from dstack._internal.core.models.provisioning_preconditions import (
@@ -8,8 +8,38 @@ from dstack._internal.core.models.provisioning_preconditions import (
     HTTPImageReadinessConfig,
     ResolvedHTTPImageReadinessConfig,
 )
+from dstack._internal.core.models.resources import Memory
+from dstack._internal.core.models.volumes import VolumeMountPoint
 
 RUNPOD_COMMUNITY_CLOUD_DEFAULT = False
+
+
+class RunpodRunStorageConfig(CoreModel):
+    region: Annotated[
+        str,
+        Field(description="The Secure Cloud data center where run volumes are created"),
+    ]
+    size: Annotated[Memory, Field(description="The size of each run volume")]
+    path: Annotated[
+        str,
+        Field(description="The absolute path where the run volume is mounted"),
+    ] = "/workspace"
+
+    @validator("region")
+    def validate_secure_cloud_region(cls, value: str) -> str:
+        if "-" not in value:
+            raise ValueError("RunPod network volumes require a Secure Cloud data center")
+        return value
+
+    @validator("size")
+    def validate_size(cls, value: Memory) -> Memory:
+        if value < 10:
+            raise ValueError("RunPod network volumes must be at least 10GB")
+        return value
+
+    @validator("path")
+    def validate_path(cls, value: str) -> str:
+        return VolumeMountPoint(name="run-storage", path=value).path
 
 
 class RunpodAPIKeyCreds(CoreModel):
@@ -47,6 +77,15 @@ class RunpodBackendConfig(CoreModel):
                 "Maximum time from Pod creation until the runner is ready, including "
                 "container image pull and unpack. Omit to use the server default"
             ),
+        ),
+    ] = None
+    run_storage: Annotated[
+        Optional[RunpodRunStorageConfig],
+        Field(
+            description=(
+                "Create one managed network volume for each single-node spot task, reuse it "
+                "across retries, and delete it after the run finishes"
+            )
         ),
     ] = None
 
