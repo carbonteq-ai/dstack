@@ -70,10 +70,20 @@ order is only a deterministic tie-breaker. The created volume then pins every
 attempt of that run to the selected data center. Fixed-region configuration
 remains supported for compatibility.
 
+RunPod's live inventory can advertise a GPU that disappears before Pod
+creation, and a region can also reject network-volume creation transiently.
+Before any attempt has provisioned, dstack now records the failed region,
+deletes the still-empty managed volume through the existing volume pipeline,
+and reuses its logical volume row in the next-cheapest eligible region. Once
+any job submission has provisioning data or the volume has an attachment,
+regional rotation is forbidden and every interruption retry remains pinned to
+the checkpoint-bearing volume. After all currently advertised regions have
+been tried, selection begins a new bounded pass so later capacity can recover.
+
 This keeps regional policy in infrastructure configuration while workload
 clients specify only resource, spot, and price requirements. Focused tests
-cover configuration validation, pool priority, and the legacy fixed-region
-path.
+cover configuration validation, lowest-price selection, empty-volume rotation,
+post-provision pinning, row reuse, and the legacy fixed-region path.
 
 ### Keep environment values out of diagnostic logs
 
@@ -209,6 +219,11 @@ package under Go 1.25, including the new no-values regression test.
 The provisioning-timeout successor passes twelve focused RunPod configuration and
 timeout tests plus Ruff; the broader submitted-job run retains its eight known
 SQLite multinode/placement failures and adds no new failure.
+The pre-start regional-failover successor passes five focused managed-storage
+tests on SQLite (the five PostgreSQL variants skip when PostgreSQL is absent),
+plus Ruff, format, and `git diff --check`. The complete submitted-job file still
+has exactly the same eight known SQLite multinode/placement failures: 50 pass
+and 58 PostgreSQL variants skip.
 Resolving a fresh unpinned dev environment and running the two broader
 submitted/running pipeline files produced 106 passes, 110 PostgreSQL skips,
 and eight SQLite failures in unrelated multinode placeholder, cluster-lock,

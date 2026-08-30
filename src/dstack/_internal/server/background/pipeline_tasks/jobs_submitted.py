@@ -160,6 +160,8 @@ from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+_RUN_STORAGE_FAILED_REGIONS_TAG = "dstack-run-storage-failed-regions"
+
 
 @dataclass
 class JobSubmittedPipelineItem(PipelineItem):
@@ -405,6 +407,11 @@ class _EnsureRunStorageResult:
 
 
 @dataclass
+class _RotateRunStorageResult:
+    volume_id: uuid.UUID
+
+
+@dataclass
 class _RetrySubmittedJobResult:
     """Transient contention outcome that resets the main job lock for a quick retry later without clearing lock_owner."""
 
@@ -461,6 +468,7 @@ class _NewCapacityAssignment:
 _AssignmentResult = Union[
     _DeferSubmittedJobResult,
     _EnsureRunStorageResult,
+    _RotateRunStorageResult,
     _TerminateSubmittedJobResult,
     _NoFleetAssignment,
     _NewCapacityAssignment,
@@ -507,6 +515,7 @@ class _NewCapacityProvisioning:
 _ProvisioningResult = Union[
     _DeferSubmittedJobResult,
     _EnsureRunStorageResult,
+    _RotateRunStorageResult,
     _TerminateSubmittedJobResult,
     _RetrySubmittedJobResult,
     _ExistingInstanceProvisioning,
@@ -636,6 +645,20 @@ async def _apply_assignment_result(
                 session=session,
                 job_model=job_model,
                 log_message="created managed run storage",
+            )
+            return
+
+        if isinstance(assignment, _RotateRunStorageResult):
+            await _apply_rotate_run_storage(
+                session=session,
+                context=context,
+                job_model=job_model,
+                volume_id=assignment.volume_id,
+            )
+            await _defer_submitted_job(
+                session=session,
+                job_model=job_model,
+                log_message="rotating empty managed run storage after no capacity",
             )
             return
 
@@ -936,13 +959,19 @@ async def _process_preconditions(
                     log_message="waiting for RunPod capacity in the managed storage region pool"
                 )
             return _EnsureRunStorageResult(configuration=run_storage, region=region)
+        if owned_volume.to_be_deleted:
+            return _DeferSubmittedJobResult(log_message="waiting for run storage rotation")
         if owned_volume.status == VolumeStatus.FAILED:
+            if run_storage.region is None and await _can_rotate_run_storage(context, owned_volume):
+                return _RotateRunStorageResult(volume_id=owned_volume.id)
             return _TerminateSubmittedJobResult(
                 reason=JobTerminationReason.VOLUME_ERROR,
                 message=f"Run storage {owned_volume.name} failed: {owned_volume.status_message}",
             )
         if owned_volume.status != VolumeStatus.ACTIVE:
             return _DeferSubmittedJobResult(log_message="waiting for run storage")
+        if run_storage.region is None and await _can_rotate_run_storage(context, owned_volume):
+            return _RotateRunStorageResult(volume_id=owned_volume.id)
 
     prepared_job_volumes = await _prepare_job_volumes(context=context)
     if isinstance(prepared_job_volumes, _TerminateSubmittedJobResult):
@@ -1016,14 +1045,70 @@ async def _select_run_storage_region(
     ]
     if not eligible_offers:
         return None
+    async with get_session_ctx() as session:
+        previous_volume = await session.scalar(
+            select(VolumeModel).where(VolumeModel.run_id == context.run_model.id)
+        )
+    failed_regions = _get_run_storage_failed_regions(previous_volume)
+    untried_offers = [
+        offer for offer in eligible_offers if offer.region.lower() not in failed_regions
+    ]
+    # Once every currently advertised region has failed, begin a new bounded
+    # pass. This avoids permanently stranding a run when capacity later returns.
+    candidates = untried_offers or eligible_offers
     selected = min(
-        eligible_offers,
+        candidates,
         key=lambda offer: (
             offer.price,
             configured_regions[offer.region.lower()][0],
         ),
     )
     return configured_regions[selected.region.lower()][1]
+
+
+def _get_run_storage_failed_regions(volume_model: Optional[VolumeModel]) -> set[str]:
+    if volume_model is None:
+        return set()
+    configuration = RunpodVolumeConfiguration.parse_raw(volume_model.configuration)
+    tags = configuration.tags or {}
+    return {
+        region.strip().lower()
+        for region in tags.get(_RUN_STORAGE_FAILED_REGIONS_TAG, "").split(",")
+        if region.strip()
+    }
+
+
+async def _can_rotate_run_storage(
+    context: _SubmittedJobContext,
+    volume_model: VolumeModel,
+) -> bool:
+    async with get_session_ctx() as session:
+        provisioned_jobs = await session.scalar(
+            select(func.count())
+            .select_from(JobModel)
+            .where(
+                JobModel.run_id == context.run_model.id,
+                JobModel.job_provisioning_data.is_not(None),
+            )
+        )
+        no_capacity_failures = await session.scalar(
+            select(func.count())
+            .select_from(JobModel)
+            .where(
+                JobModel.run_id == context.run_model.id,
+                JobModel.termination_reason
+                == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY,
+                JobModel.job_provisioning_data.is_(None),
+            )
+        )
+        attachments = await session.scalar(
+            select(func.count())
+            .select_from(VolumeAttachmentModel)
+            .where(VolumeAttachmentModel.volume_id == volume_model.id)
+        )
+    if provisioned_jobs or attachments:
+        return False
+    return volume_model.status == VolumeStatus.FAILED or bool(no_capacity_failures)
 
 
 async def _apply_ensure_run_storage(
@@ -1034,38 +1119,55 @@ async def _apply_ensure_run_storage(
     region: str,
 ) -> None:
     existing = await session.scalar(
-        select(VolumeModel).where(
-            VolumeModel.run_id == context.run_model.id,
-            VolumeModel.deleted == False,
-        )
+        select(VolumeModel).where(VolumeModel.run_id == context.run_model.id)
     )
-    if existing is not None:
+    if existing is not None and not existing.deleted:
         return
 
     volume_name = f"run-{context.run_model.id.hex}"
     mount = VolumeMountPoint(name=volume_name, path=configuration.path)
+    failed_regions = _get_run_storage_failed_regions(existing)
+    if region.lower() in failed_regions:
+        failed_regions.clear()
+    tags = {"dstack-run-id": str(context.run_model.id)}
+    if failed_regions:
+        tags[_RUN_STORAGE_FAILED_REGIONS_TAG] = ",".join(sorted(failed_regions))
     volume_configuration = RunpodVolumeConfiguration(
         name=volume_name,
         region=region,
         size=configuration.size,
         auto_cleanup_duration="off",
-        tags={"dstack-run-id": str(context.run_model.id)},
+        tags=tags,
     )
     now = get_current_datetime()
-    volume_model = VolumeModel(
-        id=uuid.uuid4(),
-        name=volume_name,
-        user_id=context.run_model.user_id,
-        project_id=context.project.id,
-        run_id=context.run_model.id,
-        status=VolumeStatus.SUBMITTED,
-        configuration=volume_configuration.json(),
-        auto_cleanup_enabled=False,
-        attachments=[],
-        created_at=now,
-        last_processed_at=now,
-    )
-    session.add(volume_model)
+    if existing is None:
+        volume_model = VolumeModel(
+            id=uuid.uuid4(),
+            name=volume_name,
+            user_id=context.run_model.user_id,
+            project_id=context.project.id,
+            run_id=context.run_model.id,
+            status=VolumeStatus.SUBMITTED,
+            configuration=volume_configuration.json(),
+            auto_cleanup_enabled=False,
+            attachments=[],
+            created_at=now,
+            last_processed_at=now,
+        )
+        session.add(volume_model)
+        event_message = "Managed run storage created. Status: SUBMITTED"
+    else:
+        volume_model = existing
+        volume_model.status = VolumeStatus.SUBMITTED
+        volume_model.status_message = None
+        volume_model.configuration = volume_configuration.json()
+        volume_model.volume_provisioning_data = None
+        volume_model.deleted = False
+        volume_model.deleted_at = None
+        volume_model.to_be_deleted = False
+        volume_model.last_processed_at = now
+        volume_model.last_job_processed_at = None
+        event_message = f"Managed run storage rotated to {region}. Status: SUBMITTED"
 
     run_model = await session.get(RunModel, context.run_model.id)
     assert run_model is not None
@@ -1085,9 +1187,68 @@ async def _apply_ensure_run_storage(
 
     events.emit(
         session,
-        "Managed run storage created. Status: SUBMITTED",
+        event_message,
         actor=events.SystemActor(),
         targets=[events.Target.from_model(volume_model), events.Target.from_model(run_model)],
+    )
+
+
+async def _apply_rotate_run_storage(
+    session: AsyncSession,
+    context: _SubmittedJobContext,
+    job_model: JobModel,
+    volume_id: uuid.UUID,
+) -> None:
+    volume_model = await session.scalar(
+        select(VolumeModel).where(
+            VolumeModel.id == volume_id,
+            VolumeModel.run_id == context.run_model.id,
+            VolumeModel.deleted == False,
+        )
+    )
+    if volume_model is None or volume_model.to_be_deleted:
+        return
+    provisioned_jobs = await session.scalar(
+        select(func.count())
+        .select_from(JobModel)
+        .where(
+            JobModel.run_id == context.run_model.id,
+            JobModel.job_provisioning_data.is_not(None),
+        )
+    )
+    no_capacity_failures = await session.scalar(
+        select(func.count())
+        .select_from(JobModel)
+        .where(
+            JobModel.run_id == context.run_model.id,
+            JobModel.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY,
+            JobModel.job_provisioning_data.is_(None),
+        )
+    )
+    attachments = await session.scalar(
+        select(func.count())
+        .select_from(VolumeAttachmentModel)
+        .where(VolumeAttachmentModel.volume_id == volume_model.id)
+    )
+    if provisioned_jobs or attachments:
+        return
+    if volume_model.status != VolumeStatus.FAILED and not no_capacity_failures:
+        return
+
+    volume_configuration = RunpodVolumeConfiguration.parse_raw(volume_model.configuration)
+    failed_regions = _get_run_storage_failed_regions(volume_model)
+    failed_regions.add(volume_configuration.region.lower())
+    tags = dict(volume_configuration.tags or {})
+    tags[_RUN_STORAGE_FAILED_REGIONS_TAG] = ",".join(sorted(failed_regions))
+    volume_configuration.tags = tags
+    volume_model.configuration = volume_configuration.json()
+    volume_model.to_be_deleted = True
+    volume_model.last_processed_at = get_current_datetime()
+    events.emit(
+        session,
+        f"Empty managed run storage scheduled for regional rotation after no capacity in {volume_configuration.region}",
+        actor=events.SystemActor(),
+        targets=[events.Target.from_model(volume_model), events.Target.from_model(job_model)],
     )
 
 
@@ -1508,6 +1669,20 @@ async def _apply_provisioning_result(
                 session=session,
                 job_model=job_model,
                 log_message="created managed run storage",
+            )
+            return
+
+        if isinstance(provisioning, _RotateRunStorageResult):
+            await _apply_rotate_run_storage(
+                session=session,
+                context=context,
+                job_model=job_model,
+                volume_id=provisioning.volume_id,
+            )
+            await _defer_submitted_job(
+                session=session,
+                job_model=job_model,
+                log_message="rotating empty managed run storage after no capacity",
             )
             return
 
@@ -2388,7 +2563,7 @@ def _hint_pipelines_fetch(
     pipeline_hinter: PipelineHinterProtocol,
     result: Union[_AssignmentResult, _ProvisioningResult],
 ) -> None:
-    if isinstance(result, _EnsureRunStorageResult):
+    if isinstance(result, (_EnsureRunStorageResult, _RotateRunStorageResult)):
         pipeline_hinter.hint_fetch(VolumeModel.__name__)
         return
     if not isinstance(result, _DeferSubmittedJobResult):
