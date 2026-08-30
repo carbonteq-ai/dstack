@@ -3,6 +3,11 @@ from typing import Annotated, List, Literal, Optional, Union
 from pydantic import Field
 
 from dstack._internal.core.models.common import CoreModel
+from dstack._internal.core.models.provisioning_preconditions import (
+    HTTPBearerCredentials,
+    HTTPImageReadinessConfig,
+    ResolvedHTTPImageReadinessConfig,
+)
 
 RUNPOD_COMMUNITY_CLOUD_DEFAULT = False
 
@@ -10,6 +15,7 @@ RUNPOD_COMMUNITY_CLOUD_DEFAULT = False
 class RunpodAPIKeyCreds(CoreModel):
     type: Literal["api_key"] = "api_key"
     api_key: Annotated[str, Field(description="The API key")]
+    provisioning_precondition: Optional[HTTPBearerCredentials] = None
 
 
 AnyRunpodCreds = RunpodAPIKeyCreds
@@ -31,6 +37,7 @@ class RunpodBackendConfig(CoreModel):
             )
         ),
     ] = None
+    provisioning_precondition: Optional[HTTPImageReadinessConfig] = None
 
 
 class RunpodBackendConfigWithCreds(RunpodBackendConfig):
@@ -52,3 +59,16 @@ class RunpodConfig(RunpodStoredConfig):
         if self.community_cloud is not None:
             return self.community_cloud
         return RUNPOD_COMMUNITY_CLOUD_DEFAULT
+
+    def resolved_provisioning_precondition(
+        self,
+    ) -> Optional[ResolvedHTTPImageReadinessConfig]:
+        if self.provisioning_precondition is None:
+            return None
+        credentials = self.creds.provisioning_precondition
+        if credentials is None:
+            return None
+        return ResolvedHTTPImageReadinessConfig(
+            **self.provisioning_precondition.dict(),
+            credentials=credentials,
+        )

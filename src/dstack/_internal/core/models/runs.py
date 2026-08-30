@@ -42,6 +42,7 @@ from dstack._internal.core.models.profiles import (
     SpotPolicy,
     UtilizationPolicy,
 )
+from dstack._internal.core.models.provisioning_preconditions import ImageReadinessSnapshot
 from dstack._internal.core.models.repos import AnyRunRepoData
 from dstack._internal.core.models.resources import Memory, ResourcesSpec
 from dstack._internal.core.models.routers import RouterType
@@ -427,6 +428,7 @@ class JobSubmission(CoreModel):
     error: Optional[str] = None
     probes: list[Probe] = []
     image_pull_progress: Optional[ImagePullProgress] = None
+    image_readiness: Optional[ImageReadinessSnapshot] = None
 
     @property
     def age(self) -> timedelta:

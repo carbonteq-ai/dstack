@@ -4,6 +4,7 @@ from datetime import timedelta
 from typing import cast
 from unittest.mock import AsyncMock, Mock, call, patch
 
+import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +25,12 @@ from dstack._internal.core.models.profiles import (
     InstanceNameSelector,
     InstanceSelector,
     Profile,
+)
+from dstack._internal.core.models.provisioning_preconditions import (
+    HTTPBearerCredentials,
+    ImageReadinessSnapshot,
+    ImageReadinessState,
+    ResolvedHTTPImageReadinessConfig,
 )
 from dstack._internal.core.models.resources import CPUSpec, Memory, Range, ResourcesSpec
 from dstack._internal.core.models.runs import JobRuntimeData, JobStatus, JobTerminationReason
@@ -451,6 +458,91 @@ class TestJobSubmittedWorker:
             )
         )
         assert len(res.scalars().all()) == 1
+
+    async def test_waits_for_verified_image_before_new_capacity_provider_call(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=1)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        digest = "sha256:" + "a" * 64
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                image=f"registry.example/carbonteq/job@{digest}",
+                commands=["true"],
+            ),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        job = await create_job(session=session, run=run)
+        offer = get_instance_offer_with_availability(backend=BackendType.RUNPOD)
+
+        backend_mock = Mock()
+        backend_mock.TYPE = BackendType.RUNPOD
+        backend_mock.get_image_readiness_precondition.return_value = (
+            ResolvedHTTPImageReadinessConfig(
+                url="http://controller.local/v1/publications",
+                timeout_seconds=60,
+                credentials=HTTPBearerCredentials(bearer_token="secret"),
+            )
+        )
+        compute_mock = Mock(spec=ComputeMockSpec)
+        backend_mock.compute.return_value = compute_mock
+        compute_mock.get_offers.return_value = [offer]
+        compute_mock.run_job.return_value = get_job_provisioning_data(
+            dockerized=True,
+            backend=BackendType.RUNPOD,
+        )
+
+        def response(state: str) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", "http://controller.local"),
+                json={"state": state},
+            )
+
+        with (
+            patch(
+                "dstack._internal.server.services.backends.get_project_backends",
+                return_value=[backend_mock],
+            ),
+            patch(
+                "httpx.AsyncClient.get",
+                new_callable=AsyncMock,
+                side_effect=[response("copying"), response("verified")],
+            ),
+        ):
+            await _process_job(session=session, worker=worker, job_model=job)
+            job = await _get_job(session, job.id)
+            assert job.instance_assigned
+
+            await _process_job(session=session, worker=worker, job_model=job)
+            job = await _get_job(session, job.id)
+            assert job.status == JobStatus.SUBMITTED
+            assert job.image_readiness is not None
+            waiting = ImageReadinessSnapshot.parse_raw(job.image_readiness)
+            assert waiting.state == ImageReadinessState.WAITING
+            compute_mock.run_job.assert_not_called()
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.PROVISIONING
+        assert job.image_readiness is not None
+        ready = ImageReadinessSnapshot.parse_raw(job.image_readiness)
+        assert ready.state == ImageReadinessState.READY
+        assert ready.started_at == waiting.started_at
+        compute_mock.run_job.assert_called_once()
 
     async def test_multinode_master_reuses_placeholder_when_provisioning_falls_back_to_run_job(
         self, test_db, session: AsyncSession, worker: JobSubmittedWorker

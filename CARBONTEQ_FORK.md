@@ -187,6 +187,31 @@ Docker cancellation whose handler takes more than ten seconds but less than
 the configured stop duration. The release must prove the finalizer marker,
 Trackio terminal state, container removal, and worker-idle state.
 
+### Gate provider creation on immutable image readiness
+
+A provider-native container backend pulls its image while creating the billed
+resource. The source registry may accept an immutable manifest before a remote
+replica has finished copying it, so creating the resource immediately can turn
+normal mirror latency into a failed and billable job attempt.
+
+The candidate adds an optional backend image-readiness precondition. RunPod is
+the first backend to expose it. The server derives the repository and exact
+`sha256` digest from the already-resolved job image, calls an authenticated
+HTTP status endpoint after offer selection but before placement groups or
+provider compute are created, and persists a secret-free snapshot on the job
+submission. `waiting` remains pre-start and survives server restart; `ready`
+permits the existing provider call; malformed images, contract/auth failures,
+and bounded timeout fail as pre-start no-capacity outcomes. Backends without
+the setting and jobs assigned to retained instances keep existing behavior.
+
+The bearer token stays in the encrypted backend auth record. Persisted state
+and API responses contain only backend, immutable image identity, public guard
+settings, timing, state, and a safe result code. Focused tests cover absent
+configuration, digest validation, pending and verified responses, restart via
+the persisted snapshot, timeout, config mismatch, authorization rejection,
+secret non-disclosure, and a pipeline proof that provider `run_job` remains
+uncalled until the exact digest is verified.
+
 ## Rebase and retirement
 
 Rebase from the exact upstream tag or commit, then inspect the runner payload

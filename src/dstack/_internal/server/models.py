@@ -586,6 +586,8 @@ class JobModel(PipelineModelMixin, BaseModel):
     should be processed only one-by-one.
     """
     image_pull_progress: Mapped[Optional[str]] = mapped_column(Text)
+    image_readiness: Mapped[Optional[str]] = mapped_column(Text)
+    """Persisted pre-create image readiness snapshot for this job submission."""
 
     __table_args__ = (
         Index(

@@ -40,6 +40,7 @@ from dstack._internal.core.models.profiles import (
     Profile,
     TerminationPolicy,
 )
+from dstack._internal.core.models.provisioning_preconditions import ImageReadinessSnapshot
 from dstack._internal.core.models.resources import Memory
 from dstack._internal.core.models.runs import (
     Job,
@@ -91,6 +92,7 @@ from dstack._internal.server.services.fleets import (
     get_next_instance_num,
     is_cloud_cluster,
 )
+from dstack._internal.server.services.image_readiness import evaluate_image_readiness
 from dstack._internal.server.services.instances import (
     filter_non_placeholder_instances,
     format_instance_blocks_for_event,
@@ -403,6 +405,7 @@ class _TerminateSubmittedJobResult:
     message: Optional[str] = None
     locked_fleet_id: Optional[uuid.UUID] = None
     placement_group_cleanup: Optional[_PlacementGroupCleanup] = None
+    image_readiness: Optional[ImageReadinessSnapshot] = None
 
 
 @dataclass
@@ -461,6 +464,13 @@ class _ProvisionNewCapacityResult:
     offer: InstanceOfferWithAvailability
     effective_profile: Profile
     placement_group_cleanup: Optional[_PlacementGroupCleanup]
+    image_readiness: Optional[ImageReadinessSnapshot] = None
+
+
+@dataclass
+class _AwaitImageReadinessResult:
+    snapshot: ImageReadinessSnapshot
+    locked_fleet_id: Optional[uuid.UUID] = None
 
 
 @dataclass
@@ -471,6 +481,7 @@ class _NewCapacityProvisioning:
     placement_group_cleanup: Optional[_PlacementGroupCleanup]
     volume_attachment_result: Optional[_VolumeAttachmentResult]
     locked_fleet_id: Optional[uuid.UUID]
+    image_readiness: Optional[ImageReadinessSnapshot] = None
 
 
 _ProvisioningResult = Union[
@@ -479,6 +490,7 @@ _ProvisioningResult = Union[
     _RetrySubmittedJobResult,
     _ExistingInstanceProvisioning,
     _NewCapacityProvisioning,
+    _AwaitImageReadinessResult,
 ]
 
 
@@ -1285,7 +1297,27 @@ async def _apply_provisioning_result(
             )
             return
 
+        if isinstance(provisioning, _AwaitImageReadinessResult):
+            job_model.image_readiness = provisioning.snapshot.json()
+            await _unlock_related_fleet(
+                session=session,
+                item=item,
+                fleet_id=provisioning.locked_fleet_id,
+            )
+            await _defer_submitted_job(
+                session=session,
+                job_model=job_model,
+                log_message=(
+                    "waiting for image readiness"
+                    if provisioning.snapshot.safe_code is None
+                    else f"waiting for image readiness ({provisioning.snapshot.safe_code})"
+                ),
+            )
+            return
+
         if isinstance(provisioning, _TerminateSubmittedJobResult):
+            if provisioning.image_readiness is not None:
+                job_model.image_readiness = provisioning.image_readiness.json()
             if provisioning.placement_group_cleanup is not None:
                 cleanup_fleet_model = await _load_placement_group_cleanup_fleet(
                     session=session,
@@ -1444,6 +1476,10 @@ async def _process_new_capacity_provisioning(
         volumes=preconditions.prepared_job_volumes.volumes,
     )
     if isinstance(provision_new_capacity_result, _TerminateSubmittedJobResult):
+        provision_new_capacity_result.locked_fleet_id = locked_fleet_id
+        return provision_new_capacity_result
+    if isinstance(provision_new_capacity_result, _AwaitImageReadinessResult):
+        provision_new_capacity_result.locked_fleet_id = locked_fleet_id
         return provision_new_capacity_result
     if isinstance(provision_new_capacity_result, _FailedNewCapacityProvisioning):
         logger.debug("%s: provisioning failed", fmt(context.job_model))
@@ -1472,6 +1508,7 @@ async def _process_new_capacity_provisioning(
         placement_group_cleanup=provision_new_capacity_result.placement_group_cleanup,
         volume_attachment_result=volume_attachment_result,
         locked_fleet_id=locked_fleet_id,
+        image_readiness=provision_new_capacity_result.image_readiness,
     )
 
 
@@ -1482,6 +1519,8 @@ async def _apply_new_capacity_provisioning(
     provisioning: _NewCapacityProvisioning,
 ) -> None:
     fresh_context = await _load_submitted_job_context(session=session, job_model=job_model)
+    if provisioning.image_readiness is not None:
+        fresh_context.job_model.image_readiness = provisioning.image_readiness.json()
     fleet_model = fresh_context.fleet_model
     assert fleet_model is not None
     await _persist_placement_group_cleanup(
@@ -2177,7 +2216,10 @@ async def _provision_new_capacity(
     master_job_provisioning_data: Optional[JobProvisioningData] = None,
     volumes: Optional[list[list[Volume]]] = None,
 ) -> Union[
-    _TerminateSubmittedJobResult, _FailedNewCapacityProvisioning, _ProvisionNewCapacityResult
+    _TerminateSubmittedJobResult,
+    _FailedNewCapacityProvisioning,
+    _ProvisionNewCapacityResult,
+    _AwaitImageReadinessResult,
 ]:
     secrets = await _load_project_secrets(project=project)
     jobs = copy.deepcopy(jobs)
@@ -2256,6 +2298,19 @@ async def _provision_new_capacity(
                 instance_offer=offer,
                 master_job_provisioning_data=master_job_provisioning_data,
             )
+        readiness = await evaluate_image_readiness(
+            backend=backend,
+            image_name=job.job_spec.image_name,
+            persisted_snapshot=job_model.image_readiness,
+        )
+        if readiness is not None and not readiness.is_ready:
+            if readiness.is_terminal:
+                return _TerminateSubmittedJobResult(
+                    reason=JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY,
+                    message=readiness.message,
+                    image_readiness=readiness.snapshot,
+                )
+            return _AwaitImageReadinessResult(snapshot=readiness.snapshot)
         if (
             # The first real instance in an empty cluster fleet is responsible
             # for creating/selecting the placement group. A placeholder alone
@@ -2307,6 +2362,7 @@ async def _provision_new_capacity(
                         ),
                         new_placement_group_models=new_placement_group_models,
                     ),
+                    image_readiness=None if readiness is None else readiness.snapshot,
                 )
             job_provisioning_data = await run_async(
                 compute.run_job,
@@ -2331,6 +2387,7 @@ async def _provision_new_capacity(
                     ),
                     new_placement_group_models=new_placement_group_models,
                 ),
+                image_readiness=None if readiness is None else readiness.snapshot,
             )
         except SkipOffer as e:
             offers_tried -= 1
