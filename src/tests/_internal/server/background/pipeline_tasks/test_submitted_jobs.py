@@ -674,6 +674,11 @@ class TestJobSubmittedWorker:
         assert rotated_configuration.tags["dstack-run-storage-failed-regions"].startswith(
             "us-ks-2:"
         )
+        volume.status = VolumeStatus.ACTIVE
+        await session.commit()
+        await _process_job(session=session, worker=worker, job_model=current_job)
+        await session.refresh(volume)
+        assert not volume.to_be_deleted
         volume_count = await session.scalar(
             select(func.count()).select_from(VolumeModel).where(VolumeModel.run_id == run.id)
         )

@@ -1145,6 +1145,7 @@ async def _can_rotate_run_storage(
                 JobModel.termination_reason
                 == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY,
                 JobModel.job_provisioning_data.is_(None),
+                JobModel.last_processed_at >= volume_model.last_processed_at,
             )
         )
         attachments = await session.scalar(
@@ -1273,6 +1274,7 @@ async def _apply_rotate_run_storage(
             JobModel.run_id == context.run_model.id,
             JobModel.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY,
             JobModel.job_provisioning_data.is_(None),
+            JobModel.last_processed_at >= volume_model.last_processed_at,
         )
     )
     attachments = await session.scalar(
