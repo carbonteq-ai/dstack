@@ -271,6 +271,14 @@ PostgreSQL skips, and exactly the same eight unrelated SQLite multinode and
 placement failures. No production or provider canary was run for this policy
 follow-up.
 
+The availability-first region successor passes all 30 selected RunPod backend,
+managed-storage, rotation, and cooldown tests (with three PostgreSQL variants
+skipped when PostgreSQL is absent), plus Ruff and `git diff --check`. An
+authenticated read-only live-offer smoke reported `US-MD-1` A100 stock as
+Medium and the remaining eligible US A100 regions as Low; the new ranking put
+`US-MD-1` first despite its higher price. Deployment and the bounded provider
+canary remain release gates.
+
 Before publication, repeat the Python suite with PostgreSQL enabled, build the
 server and both binaries from the immutable candidate commit, and run a live
 Docker cancellation whose handler takes more than ten seconds but less than
@@ -363,6 +371,15 @@ retryable and no longer emit a false `Volume deleted` event or set `deleted_at`.
 The existing persisted volume row plus its terminal event is the cleanup
 receipt, so this adds no second controller or cleanup ledger.
 
+Before creating that managed volume, the successor cross-checks live spot
+offers against RunPod's authenticated per-data-center GPU `stockStatus`.
+Regions with blank or unreported stock are excluded, and eligible regions rank
+`High`, `Medium`, then `Low` before price and backend configuration order. This
+prevents a cheaper low-inventory region from owning the run's volume while a
+stronger region is available. Because RunPod does not provide a reservable
+capacity lease, provider allocation can still race after selection; the
+existing bounded empty-volume rotation remains the recovery path.
+
 Focused RunPod configuration, running-job, submitted-job, run-termination, and
 volume-deletion tests pass. The SQLite migration was exercised from an empty
 database through head and back to its predecessor.
@@ -382,5 +399,5 @@ Server Edition. dstack observed submission through `done`, CUDA reported
 97,887 MiB visible VRAM, and fleet deletion left the RunPod account with zero
 active Pods.
 
-Published fork commit: `d2586c3871525e461bcbc442deaa511af2a87758` on branch
+Published fork commit: `f843a6497c2f270bc52fd4a8b27769884c0824a9` on branch
 `codex/registry-default-auth`.
