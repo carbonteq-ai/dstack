@@ -248,13 +248,56 @@ fail-closed: an unlisted project and an unlisted user are rejected at submission
 Membership is dstack's own; there is no parallel list to maintain.
 
 **e. Check it took.** The server logs `Loaded plugin ctpolicy` at startup — if it
-does not, nothing is being enforced. Then, as a team member:
+does not, nothing is being enforced.
+
+The quickest proof that the policy is live is to apply as someone who is *not*
+in `policy.yaml` — an admin will do. It must be rejected by name:
 
 ```
-dstack apply -f task.dstack.yml    # plan table shows the clamped
-                                   # max_duration / max_price / priority
-dstack ps                          # shows only this team's runs
+dstack apply --project team-research -f probe.dstack.yml
+# No policy entry for user 'admin' in team 'team-research'.
 ```
+
+That one message shows the plugin loaded, the file deployed, and fail-closed
+working. Then, as a real team member:
+
+```
+dstack apply -f probe.dstack.yml   # plan shows the clamped Max duration / Max price
+dstack ps                          # only this team's runs
+```
+
+Use a probe with an explicit small disk:
+
+```yaml
+type: task
+name: policy-probe
+image: ubuntu:24.04
+commands: ["echo hello"]
+priority: 100
+resources:
+  cpu: 1..
+  memory: 1GB..
+  disk: 10GB..     # REQUIRED: the default is a 100GB *minimum*, and a worker
+                   # that cannot meet it reports "No matching instance offers
+                   # available" — which reads like a policy rejection but is not
+```
+
+Two things the plan table cannot tell you: it prints Max duration and Max price
+but **not** `priority` or `backends`, and `-v` does not add them. To confirm
+those, read `effective_run_spec` from the plan API, or the stored spec after
+submitting:
+
+```
+dstack ps --json | python3 -c 'import sys,json
+d=json.load(sys.stdin)          # {"project": ..., "runs": [...]} — not a bare list
+for r in d["runs"]:
+    c=r["run_spec"]["configuration"]
+    print(r["run_spec"]["run_name"], c["priority"], c["backends"])'
+```
+
+`priority: 100` in the file should store as the top of the team band — 99 for a
+`[70, 99]` team, 69 for `[40, 69]` — which is team priority dominating job
+priority.
 
 Outside the team's window, the same apply is rejected with the schedule and the
 next opening.
@@ -301,8 +344,7 @@ usage as of 2026-08-31 04:09:06 UTC (0s ago)
 team-research   priority band 70-99
   window  mon/tue/wed/thu/fri 08:00-20:00 Asia/Karachi — open, closes in 10h50m
   max run 12h  time 271h/400h (+12h committed)  cloud $1487.20/$1500.00 (+$61.00 committed)  max $4.00/hr
-  example-intern       max run 2h  time 0m/20h (+0m committed)  cloud off
-  example-researcher   inherits team defaults
+  talha                inherits team defaults
 ```
 
 `--json` emits the same thing for scripting. It reads the policy file and the
