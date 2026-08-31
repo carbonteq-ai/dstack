@@ -1,5 +1,19 @@
 # CarbonTeq dstack policy layer
 
+> **SUPERSEDED — the code this describes was deleted from this branch on
+> 2026-08-31 (task T3).** `ctpolicy` resolved a run's team from the dstack
+> project name, and ADR-026 puts every run in a single project under the control
+> plane's own service credential — so it would resolve `team="main"`, find no
+> entry, and reject every submission. It is not a redundant second gate; it is
+> incompatible. See `docs/phase-2/10-open-questions.md` Q2 in the control-plane
+> repository.
+>
+> The document is kept because it is the best record of which dstack behaviours
+> were verified in source, and of why the per-team-project structure existed.
+> ADR-024 wants it moved to the control-plane repository's `docs/`; that is a
+> change on `main`, so it still lives here. Read the source it describes with
+> `git show <commit-before-T3>:policy/src/ctpolicy/plugin.py`.
+
 ## Status
 
 Complete, on branch `dstack-cp-mvp`. Compute windows, run-duration ceilings, the
@@ -23,7 +37,7 @@ Two deliberate deployment states to know about:
 
 This document is the decision record. [`CARBONTEQ_FORK.md`](CARBONTEQ_FORK.md)
 remains the rebase ledger for changes inside upstream files;
-[`policy/README.md`](policy/README.md) is the package's own reference; and
+`policy/README.md` was the package's own reference, and went with it; and
 `app/deploy/dstack-server/README.md`, in the control-plane
 repository, is the deployment guide.
 

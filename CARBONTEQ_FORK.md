@@ -66,6 +66,34 @@ and spend figures, which were redacted in the copy that moved and remain in this
 branch's history. That was a deliberate scope decision, recorded in the consumer
 repository's `harness/progress.md`.
 
+## Deleted: the ctpolicy package
+
+`policy/` — 1,949 lines of source and 1,782 of tests — was deleted on 2026-08-31
+(task T3), and the `Dockerfile` no longer builds or installs its wheel.
+
+It was built for a premise we reversed. `ctpolicy` assumed users keep the
+official dstack CLI, so enforcement had to live inside the server. The control
+plane is now the only client and nobody holds a dstack token, so enforcement
+lives there instead (ADR-020). More decisively, `ctpolicy` resolves a run's team
+from the dstack project name, and ADR-026 puts every run in one project under a
+service credential — it would reject every submission. Incompatible, not merely
+redundant.
+
+Where the logic went: `config.py` and `windows.py` to the control plane's
+`backend/policy/`; `usage.py` and the enforcer's snapshot loop to
+`backend/usage/`; `plugin.py`'s decision table to `backend/admission/`. The
+enforcer's *termination* backstop is deliberately not reproduced — ADR-022 clamps
+`max_duration` instead of terminating. `cli.py` is replaced by `ctl quota`.
+
+The one thing in the code that the design documents did not carry — that the
+cloud rules must run *before* the duration clamp, because a run pinned to on-prem
+cannot spend money and must not have its duration cut by a dollar budget — is now
+recorded in the control plane's `docs/phase-2/04-accounting.md`.
+
+Nothing here is a rebase surface: `policy/` was an additive package and touched
+no upstream file. Recovering it needs no special measure — it is an ordinary
+deletion, so the tree before this commit still has it.
+
 ## Maintained delta
 
 ### Honor bounded task stop duration
