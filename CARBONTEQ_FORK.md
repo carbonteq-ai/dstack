@@ -9,6 +9,37 @@ Published candidate branch. The working tree is based on upstream dstack
 by full SHA; deployment remains blocked until one matching server/runner/shim
 release is built and qualified.
 
+## Purged from history
+
+`docker/server/carbonteq/policy.yaml` was removed from every commit on this
+branch on 2026-08-31, together with `policy/tests/test_shipped_config.py`, whose
+fixtures read it.
+
+`origin` is a **public** fork of `dstackai/dstack`. That file committed named
+employees, their team assignments and their dollar budgets. It is operator data
+and belongs in no public mirror under any structure. It was purged rather than
+deleted in a later commit, because a deletion leaves the content in history and
+the disclosure survives it.
+
+The rewrite replaced head `69f8a7a4da3e`. Fifteen fork commits above the
+upstream merge base became fourteen: `518f7f49` ("Assign the real users to team
+projects in policy.yaml") touched nothing else and was pruned as empty. The
+eight commits predating the file keep their original ids. Diffing the old head
+against the new one shows those two files and nothing else.
+
+Anyone holding the old branch must reset to the new head. Merging reintroduces
+the file.
+
+**This is not full remediation.** On GitHub the pre-rewrite commits remain
+reachable by SHA, and a fork network shares an object pool, so they can also be
+fetched through the parent repository. Only GitHub Support can make them
+unreachable. Treat the names and the budgets as disclosed; no credential was
+involved, so nothing requires rotation.
+
+Do not reintroduce a policy file here. Policy is the control plane's under
+ADR-020 — the schema and the deployed values live in the consumer repository,
+and this tree carries only the deltas that cannot live outside dstack.
+
 ## Maintained delta
 
 ### Honor bounded task stop duration
