@@ -1,4 +1,6 @@
+import hashlib
 import json
+import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import asdict
@@ -6,6 +8,7 @@ from datetime import timedelta
 from typing import Callable, List, Optional
 
 import gpuhunt
+import requests
 from gpuhunt.providers.runpod import RunpodProvider
 
 from dstack._internal.core.backends.base.backend import Compute
@@ -15,7 +18,6 @@ from dstack._internal.core.backends.base.compute import (
     ComputeWithMultinodeSupport,
     ComputeWithVolumeSupport,
     generate_unique_instance_name,
-    generate_unique_volume_name,
     get_docker_commands,
     get_job_instance_name,
 )
@@ -52,6 +54,7 @@ from dstack._internal.core.models.volumes import (
     Volume,
     VolumeProvisioningData,
 )
+from dstack._internal.core.services import is_valid_dstack_resource_name
 from dstack._internal.utils.common import get_current_datetime, get_or_error
 from dstack._internal.utils.logging import get_logger
 
@@ -439,16 +442,38 @@ class RunpodCompute(
 
     def create_volume(self, volume: Volume) -> VolumeProvisioningData:
         assert isinstance(volume.configuration, RunpodVolumeConfiguration)
-        volume_name = generate_unique_volume_name(volume, max_length=MAX_RESOURCE_NAME_LEN)
         size_gb = volume.configuration.size_gb
         # Runpod regions must be uppercase.
         # Lowercase regions are accepted in the API but they break Runpod in several ways.
         region = volume.configuration.region.upper()
-        volume_id = self.api_client.create_network_volume(
-            name=volume_name,
-            region=region,
-            size=size_gb,
-        )
+        volume_name = _get_runpod_volume_name(volume, region)
+        volume_id = self._find_existing_volume_id(volume_name, region, size_gb)
+        if volume_id is None:
+            try:
+                volume_id = self.api_client.create_network_volume(
+                    name=volume_name,
+                    region=region,
+                    size=size_gb,
+                )
+            except requests.RequestException:
+                # RunPod may finish createNetworkVolume after returning an HTTP
+                # 500. Reconcile the deterministic provider name before
+                # reporting failure; a later retry can adopt the same volume.
+                for delay in (0, 1, 2, 4, 8):
+                    if delay:
+                        time.sleep(delay)
+                    try:
+                        volume_id = self._find_existing_volume_id(volume_name, region, size_gb)
+                    except requests.RequestException:
+                        continue
+                    if volume_id is not None:
+                        logger.info(
+                            "Reconciled RunPod volume %s after an ambiguous create response",
+                            volume_name,
+                        )
+                        break
+                else:
+                    raise
         return VolumeProvisioningData(
             backend=BackendType.RUNPOD,
             volume_id=volume_id,
@@ -457,6 +482,19 @@ class RunpodCompute(
             attachable=False,
             detachable=False,
         )
+
+    def _find_existing_volume_id(self, name: str, region: str, size_gb: int) -> Optional[str]:
+        matches = self.api_client.get_network_volumes_by_name(name)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ComputeError(f"Multiple RunPod volumes found with deterministic name {name}")
+        volume = matches[0]
+        actual_region = volume["dataCenter"]["id"].upper()
+        actual_size_gb = int(volume["size"])
+        if actual_region != region or actual_size_gb != size_gb:
+            raise ComputeError(f"RunPod volume {name} conflicts with requested region or size")
+        return volume["id"]
 
     def delete_volume(self, volume: Volume):
         if volume.volume_id is not None:
@@ -568,6 +606,15 @@ def _should_query_live_gpu_offers(requirements: Requirements) -> bool:
         and gpu is not None
         and (gpu.count.min or 0) > 0
     )
+
+
+def _get_runpod_volume_name(volume: Volume, region: str) -> str:
+    prefix = f"dstack-{volume.name}"
+    if volume.project_name and is_valid_dstack_resource_name(volume.project_name):
+        prefix = f"dstack-{volume.project_name}-{volume.name}"
+    suffix = hashlib.sha256(f"{volume.id}:{region}".encode()).hexdigest()[:8]
+    prefix = prefix[: MAX_RESOURCE_NAME_LEN - len(suffix) - 1]
+    return f"{prefix}-{suffix}"
 
 
 def _get_live_gpu_offers(

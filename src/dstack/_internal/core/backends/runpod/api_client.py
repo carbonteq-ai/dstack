@@ -250,7 +250,7 @@ class RunpodApiClient:
             }
         )
 
-    def get_network_volume(self, volume_id: str) -> Optional[Dict]:
+    def get_network_volumes(self) -> List[Dict]:
         response = self._make_request(
             {
                 "query": """
@@ -270,11 +270,16 @@ class RunpodApiClient:
                 """
             }
         )
-        network_volumes = response.json()["data"]["myself"]["networkVolumes"]
-        for vol in network_volumes:
+        return response.json()["data"]["myself"]["networkVolumes"]
+
+    def get_network_volume(self, volume_id: str) -> Optional[Dict]:
+        for vol in self.get_network_volumes():
             if vol["id"] == volume_id:
                 return vol
         return None
+
+    def get_network_volumes_by_name(self, name: str) -> List[Dict]:
+        return [volume for volume in self.get_network_volumes() if volume["name"] == name]
 
     def create_network_volume(self, name: str, region: str, size: int) -> str:
         response = self._make_request(

@@ -1,18 +1,25 @@
+import uuid
 from unittest.mock import MagicMock, patch
 
 import gpuhunt
 import pytest
+import requests
 from gpuhunt.providers.runpod import RunpodProvider
 
 from dstack._internal.core.backends.runpod.compute import (
     RunpodCompute,
     RunpodOfferBackendData,
+    _get_runpod_volume_name,
     _RunpodLiveGPUProvider,
 )
-from dstack._internal.core.backends.runpod.models import RunpodAPIKeyCreds, RunpodConfig
+from dstack._internal.core.backends.runpod.models import (
+    RunpodAPIKeyCreds,
+    RunpodConfig,
+)
 from dstack._internal.core.errors import ProvisioningError
 from dstack._internal.core.models.resources import ResourcesSpec
 from dstack._internal.core.models.runs import Requirements
+from dstack._internal.core.models.volumes import RunpodVolumeConfiguration
 
 
 def test_live_provider_bounds_queries_to_requested_secure_location_and_gpu_count():
@@ -176,3 +183,77 @@ def test_pod_without_runtime_keeps_waiting_for_provisioning():
     compute.update_provisioning_data(provisioning_data, "public", "private")
 
     assert provisioning_data.hostname is None
+
+
+def _managed_volume():
+    volume = MagicMock()
+    volume.id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    volume.name = "run-12345678123456781234567812345678"
+    volume.project_name = "main"
+    volume.configuration = RunpodVolumeConfiguration(
+        name=volume.name,
+        size="100GB",
+        region="US-CA-2",
+    )
+    return volume
+
+
+def test_volume_name_is_deterministic_per_logical_volume_and_region():
+    volume = _managed_volume()
+
+    first = _get_runpod_volume_name(volume, "US-CA-2")
+    second = _get_runpod_volume_name(volume, "US-CA-2")
+    other_region = _get_runpod_volume_name(volume, "US-WA-1")
+
+    assert first == second
+    assert first != other_region
+    assert len(first) <= 60
+
+
+def test_ambiguous_volume_create_adopts_the_provider_result():
+    volume = _managed_volume()
+    compute = RunpodCompute(RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret")))
+    provider_name = _get_runpod_volume_name(volume, "US-CA-2")
+    created = {
+        "id": "volume-1",
+        "name": provider_name,
+        "size": 100,
+        "dataCenter": {"id": "US-CA-2"},
+    }
+    compute.api_client.get_network_volumes_by_name = MagicMock(side_effect=[[], [], [created]])
+    compute.api_client.create_network_volume = MagicMock(
+        side_effect=requests.HTTPError("500 Server Error")
+    )
+
+    with patch("dstack._internal.core.backends.runpod.compute.time.sleep") as sleep:
+        provisioning = compute.create_volume(volume)
+
+    assert provisioning.volume_id == "volume-1"
+    compute.api_client.create_network_volume.assert_called_once_with(
+        name=provider_name,
+        region="US-CA-2",
+        size=100,
+    )
+    sleep.assert_called_once_with(1)
+
+
+def test_volume_retry_adopts_an_existing_deterministic_provider_volume():
+    volume = _managed_volume()
+    compute = RunpodCompute(RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret")))
+    provider_name = _get_runpod_volume_name(volume, "US-CA-2")
+    compute.api_client.get_network_volumes_by_name = MagicMock(
+        return_value=[
+            {
+                "id": "volume-1",
+                "name": provider_name,
+                "size": 100,
+                "dataCenter": {"id": "US-CA-2"},
+            }
+        ]
+    )
+    compute.api_client.create_network_volume = MagicMock()
+
+    provisioning = compute.create_volume(volume)
+
+    assert provisioning.volume_id == "volume-1"
+    compute.api_client.create_network_volume.assert_not_called()

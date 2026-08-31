@@ -101,3 +101,43 @@ def test_get_data_center_gpu_availability(monkeypatch):
     }
     assert "gpuAvailability" in query["value"]
     assert "gpuTypeId" in query["value"]
+
+
+def test_get_network_volumes_by_name(monkeypatch):
+    client = RunpodApiClient(api_key="test")
+
+    monkeypatch.setattr(
+        client,
+        "_make_request",
+        lambda _data: _Response(
+            {
+                "data": {
+                    "myself": {
+                        "networkVolumes": [
+                            {
+                                "id": "volume-1",
+                                "name": "expected",
+                                "size": 100,
+                                "dataCenter": {"id": "US-CA-2", "name": "US California"},
+                            },
+                            {
+                                "id": "volume-2",
+                                "name": "other",
+                                "size": 100,
+                                "dataCenter": {"id": "US-WA-1", "name": "US Washington"},
+                            },
+                        ]
+                    }
+                }
+            }
+        ),
+    )
+
+    assert client.get_network_volumes_by_name("expected") == [
+        {
+            "id": "volume-1",
+            "name": "expected",
+            "size": 100,
+            "dataCenter": {"id": "US-CA-2", "name": "US California"},
+        }
+    ]
