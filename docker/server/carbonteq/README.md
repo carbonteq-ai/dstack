@@ -237,7 +237,7 @@ A global export is auto-imported into every project, including ones created
 later. Confirm from a team project:
 
 ```
-dstack fleet list --include-imported
+dstack fleet list   # already includes imported fleets; there is no flag
 ```
 
 **c. Write the policy.** Edit `policy.yaml` so every team in `config.yml` has an
