@@ -229,7 +229,7 @@ async def submit_run(
     # call belongs here rather than inside `submit_run()` because `apply_plan()`
     # has already applied policies by the time it calls that function, and a
     # second pass would re-apply them to an already-modified spec.
-    # See CARBONTEQ_FORK.md and CARBONTEQ_POLICY.md.
+    # See CARBONTEQ_FORK.md.
     run_spec = await apply_plugin_policies(
         user=user.name,
         project=project.name,

@@ -216,8 +216,11 @@ and `TestSubmitRun::test_persists_the_spec_a_plugin_policy_returns` in
 `src/tests/_internal/server/routers/test_runs.py`. Both were confirmed to fail
 with the delta reverted.
 
-The design this supports is recorded in `CARBONTEQ_POLICY.md`; the policy plugin
-itself lives in `policy/` and is additive, so it carries no rebase surface.
+The design this supported is recorded in the control-plane repository as
+`docs/00-context/ctpolicy-history.md`. The plugin itself lived in `policy/`,
+which was additive and carried no rebase surface; both left this tree at T3 and
+N2. The delta below is not affected — it closes a guardrail bypass that exists
+whether or not any policy plugin is installed.
 
 ### One-shot deferred start
 
