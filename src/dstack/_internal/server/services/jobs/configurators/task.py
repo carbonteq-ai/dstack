@@ -1,5 +1,6 @@
 from typing import List, Optional
 
+from dstack._internal.core.errors import ServerClientError
 from dstack._internal.core.models.configurations import PortMapping, RunConfigurationType
 from dstack._internal.core.models.profiles import SpotPolicy
 from dstack._internal.core.models.runs import JobSpec
@@ -11,6 +12,8 @@ class TaskJobConfigurator(JobConfigurator):
 
     async def get_job_specs(self, replica_num: int) -> List[JobSpec]:
         assert self.run_spec.configuration.type == "task"
+        if self.run_spec.merged_profile.stop_duration == "off":
+            raise ServerClientError("Dockerized tasks require a bounded stop_duration")
         job_specs = []
         for job_num in range(self.run_spec.configuration.nodes):
             job_spec = await self._get_job_spec(

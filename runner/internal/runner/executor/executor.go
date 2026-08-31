@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -120,7 +121,6 @@ func NewRunExecutor(tempDir string, dstackDir string, currentUser linuxuser.User
 		runnerLogs:      newAppendWriter(mu, timestamp),
 		timestamp:       timestamp,
 
-		killDelay:         10 * time.Second,
 		connectionTracker: connectionTracker,
 	}, nil
 }
@@ -275,10 +275,18 @@ func (ex *RunExecutor) SetJob(body schemas.SubmitBody) {
 	ex.run = body.Run
 	ex.jobSubmission = body.JobSubmission
 	ex.jobSpec = body.JobSpec
+	ex.killDelay = 0
+	if body.JobSpec.StopDuration != nil {
+		ex.killDelay = time.Duration(*body.JobSpec.StopDuration) * time.Second
+	}
 	ex.clusterInfo = body.ClusterInfo
 	ex.secrets = body.Secrets
 	ex.repoCredentials = body.RepoCredentials
 	ex.jobLogs.SetQuota(body.LogQuotaHour)
+}
+
+func stopImmediately(stopDuration *uint) bool {
+	return stopDuration != nil && *stopDuration == 0
 }
 
 func (ex *RunExecutor) SetJobState(ctx context.Context, state schemas.JobState) {
@@ -494,12 +502,15 @@ func (ex *RunExecutor) execJob(ctx context.Context, jobLogFile io.Writer) error 
 	}
 
 	cmd := exec.CommandContext(ctx, ex.jobSpec.Commands[0], ex.jobSpec.Commands[1:]...)
+	// startCommand() runs the job on a pty as a session leader, so a shell
+	// entrypoint enables job control and puts the actual workload in its own
+	// process group. jobTTY lets Cancel reach that group; see signalJobGroup.
+	var jobTTY atomic.Pointer[os.File]
 	cmd.Cancel = func() error {
-		// returns error on Windows
-		if signalErr := cmd.Process.Signal(os.Interrupt); signalErr != nil {
-			return fmt.Errorf("send interrupt signal: %w", signalErr)
+		if stopImmediately(ex.jobSpec.StopDuration) {
+			return killJobImmediately(jobTTY.Load(), cmd.Process)
 		}
-		return nil
+		return signalJobGroup(jobTTY.Load(), cmd.Process, syscall.SIGINT)
 	}
 	cmd.WaitDelay = ex.killDelay // kills the process if it doesn't exit in time
 
@@ -571,12 +582,22 @@ func (ex *RunExecutor) execJob(ctx context.Context, jobLogFile io.Writer) error 
 	envMap["HOME"] = ex.jobUser.HomeDir
 	cmd.Env = envMap.Render()
 
-	log.Trace(ctx, "Starting exec", "cmd", cmd.String(), "working_dir", cmd.Dir, "env", cmd.Env)
+	log.Trace(
+		ctx,
+		"Starting exec",
+		"cmd", cmd.String(),
+		"working_dir", cmd.Dir,
+		"env_names", envNames(cmd.Env),
+	)
 
 	ptm, err := startCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("start command: %w", err)
 	}
+	// Publish the pty before the first cancellation can be observed. Cancel may
+	// still run before this store in the narrow window right after Start(); it
+	// falls back to the process group of the command itself in that case.
+	jobTTY.Store(ptm)
 	defer func() { _ = ptm.Close() }()
 	defer func() { _ = cmd.Wait() }() // release resources if copy fails
 
@@ -697,6 +718,64 @@ func isPtyError(err error) bool {
 // with two additions:
 // * controlling terminal is properly set (cmd.Extrafiles, Cmd.SysProcAttr.Ctty)
 // * owner of slave pty is changed to the child process uid
+// signalJobGroup delivers sig to the process group that actually runs the job.
+//
+// A task's commands are executed through an interactive shell
+// (`/bin/sh -i -c "<commands>"`), and startCommand() starts that shell as a
+// session leader with the pty as its controlling terminal. The shell therefore
+// enables job control and places the workload in its OWN process group, which
+// it makes the terminal's foreground group. Signalling only the shell's pid
+// never reaches the workload: an interactive shell does not forward the signal
+// to its foreground child, so the workload keeps running until the hard kill
+// and never gets the chance to shut down cleanly within the stop duration.
+//
+// Delivering the signal to the terminal's foreground process group is what a
+// terminal does for Ctrl+C, and it reaches the workload itself. The shell is
+// deliberately left alone so it stays alive to wait for the workload; killing
+// the shell here would let the runner observe the command as finished while the
+// workload is still shutting down, truncating the stop duration.
+func signalJobGroup(tty *os.File, process *os.Process, sig syscall.Signal) error {
+	if process == nil {
+		return nil
+	}
+	if tty != nil {
+		if pgid, err := unix.IoctlGetInt(int(tty.Fd()), unix.TIOCGPGRP); err == nil && pgid > 0 {
+			if killErr := syscall.Kill(-pgid, sig); killErr == nil {
+				return nil
+			} else if !errors.Is(killErr, syscall.ESRCH) {
+				return fmt.Errorf("signal job process group: %w", killErr)
+			}
+		}
+	}
+	// No usable terminal foreground group: fall back to the command's own
+	// process group, then to the command itself.
+	if pgid, err := syscall.Getpgid(process.Pid); err == nil && pgid > 0 {
+		if killErr := syscall.Kill(-pgid, sig); killErr == nil {
+			return nil
+		} else if !errors.Is(killErr, syscall.ESRCH) {
+			return fmt.Errorf("signal command process group: %w", killErr)
+		}
+	}
+	if signalErr := process.Signal(sig); signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
+		return fmt.Errorf("send %v signal: %w", sig, signalErr)
+	}
+	return nil
+}
+
+// killJobImmediately terminates the workload and its shell without any grace.
+// Unlike the graceful path this also kills the command's own process group,
+// because no orderly shutdown is expected when the stop duration is zero.
+func killJobImmediately(tty *os.File, process *os.Process) error {
+	if process == nil {
+		return nil
+	}
+	groupErr := signalJobGroup(tty, process, syscall.SIGKILL)
+	if killErr := process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+		return fmt.Errorf("kill process: %w", killErr)
+	}
+	return groupErr
+}
+
 func startCommand(cmd *exec.Cmd) (*os.File, error) {
 	ptm, pts, err := pty.Open()
 	if err != nil {

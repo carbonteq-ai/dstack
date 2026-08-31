@@ -215,7 +215,119 @@ class TestRunActiveWorker:
         # Retryable failure → PENDING with resubmission_attempt incremented
         assert run.status == RunStatus.PENDING
         assert run.resubmission_attempt == 1
+        assert json.loads(run.retry_state)["error"]["attempts"] == 1
         assert run.lock_token is None
+
+    async def test_interruption_retry_budget_is_anchored_to_first_interruption(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        now = get_current_datetime()
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(
+                name="default",
+                retry=ProfileRetry(
+                    duration=86_400,
+                    duration_by_event={RetryEvent.INTERRUPTION: 7_200},
+                    max_attempts_by_event={RetryEvent.INTERRUPTION: 5},
+                    on_events=[RetryEvent.INTERRUPTION],
+                ),
+            ),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            status=RunStatus.RUNNING,
+            retry_state=json.dumps(
+                {
+                    "interruption": {
+                        "attempts": 1,
+                        "first_at": (now - timedelta(hours=3)).isoformat(),
+                    }
+                }
+            ),
+        )
+        await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.FAILED,
+            termination_reason=JobTerminationReason.INTERRUPTED_BY_NO_CAPACITY,
+            job_provisioning_data=get_job_provisioning_data(),
+            last_processed_at=now - timedelta(minutes=1),
+        )
+        lock_run(run)
+        await session.commit()
+
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.runs.active.get_current_datetime",
+            return_value=now,
+        ):
+            await worker.process(run_to_pipeline_item(run))
+
+        await session.refresh(run)
+        assert run.status == RunStatus.TERMINATING
+        assert run.termination_reason == RunTerminationReason.RETRY_LIMIT_EXCEEDED
+
+    async def test_interruption_retry_stops_after_five_recoveries(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        now = get_current_datetime()
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(
+                name="default",
+                retry=ProfileRetry(
+                    duration=7_200,
+                    max_attempts_by_event={RetryEvent.INTERRUPTION: 5},
+                    on_events=[RetryEvent.INTERRUPTION],
+                ),
+            ),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            status=RunStatus.RUNNING,
+            retry_state=json.dumps(
+                {
+                    "interruption": {
+                        "attempts": 5,
+                        "first_at": (now - timedelta(minutes=10)).isoformat(),
+                    }
+                }
+            ),
+        )
+        await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.FAILED,
+            termination_reason=JobTerminationReason.INTERRUPTED_BY_NO_CAPACITY,
+            job_provisioning_data=get_job_provisioning_data(),
+            last_processed_at=now,
+        )
+        lock_run(run)
+        await session.commit()
+
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.runs.active.get_current_datetime",
+            return_value=now,
+        ):
+            await worker.process(run_to_pipeline_item(run))
+
+        await session.refresh(run)
+        assert run.status == RunStatus.TERMINATING
+        assert run.termination_reason == RunTerminationReason.RETRY_LIMIT_EXCEEDED
 
     async def test_retries_no_capacity_replica_and_keeps_service_running(
         self, test_db, session: AsyncSession, worker: RunWorker

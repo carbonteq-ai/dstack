@@ -113,3 +113,15 @@ func TestEnvMapUpdate_Merge_Expand(t *testing.T) {
 	}
 	assert.Equal(t, expected, envMap)
 }
+
+func TestEnvNames_DoesNotExposeValues(t *testing.T) {
+	names := envNames([]string{
+		"RUNPOD_API_KEY=provider-secret",
+		"PATH=/usr/local/bin:/usr/bin",
+		"REGISTRY_PASSWORD=value=with=equals",
+		"malformed",
+	})
+
+	assert.Equal(t, []string{"PATH", "REGISTRY_PASSWORD", "RUNPOD_API_KEY"}, names)
+	assert.NotContains(t, names, "provider-secret")
+}

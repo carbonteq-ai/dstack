@@ -15,6 +15,7 @@ from dstack._internal.core.backends.base.compute import ComputeWithVolumeSupport
 from dstack._internal.core.consts import DSTACK_SHIM_HTTP_PORT
 from dstack._internal.core.errors import BackendError, GatewayError, SSHError
 from dstack._internal.core.models.instances import InstanceStatus, InstanceTerminationReason
+from dstack._internal.core.models.profiles import DEFAULT_STOP_DURATION
 from dstack._internal.core.models.runs import (
     JobProvisioningData,
     JobRuntimeData,
@@ -745,10 +746,17 @@ async def _stop_job_gracefully(
     Tells the runner to stop the job's command. Records the first graceful-stop attempt and
     sets `remove_at` so `_process_terminating_job()` stops the container on a later iteration.
     """
+    stop_duration = get_job_spec(job_model).stop_duration
+    if stop_duration is None:
+        logger.warning(
+            "%s: using the default stop duration for a legacy unbounded task",
+            fmt(job_model),
+        )
+        stop_duration = DEFAULT_STOP_DURATION
     job_update_map = _JobUpdateMap()
     await stop_runner(job_model=job_model, instance_model=instance_model)
     job_update_map["graceful_termination_attempts"] = 1
-    job_update_map["remove_at"] = get_current_datetime() + timedelta(seconds=10)
+    job_update_map["remove_at"] = get_current_datetime() + timedelta(seconds=stop_duration)
     return job_update_map
 
 

@@ -1618,6 +1618,71 @@ class TestJobRunningWorker:
         assert job.status == JobStatus.TERMINATING
         assert job.termination_reason == JobTerminationReason.INSTANCE_UNREACHABLE
 
+    async def test_missing_provider_spot_instance_interrupts_immediately(
+        self,
+        test_db,
+        session: AsyncSession,
+        worker: JobRunningWorker,
+    ):
+        project = await create_project(session=session)
+        await create_backend(
+            session=session,
+            project_id=project.id,
+            backend_type=BackendType.RUNPOD,
+            config={},
+            auth={"type": "api_key", "api_key": "test-api-key"},
+        )
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            status=InstanceStatus.BUSY,
+            backend=BackendType.RUNPOD,
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.RUNNING,
+            job_provisioning_data=get_job_provisioning_data(
+                backend=BackendType.RUNPOD,
+                region="US-WA-1",
+                spot=True,
+            ),
+            instance=instance,
+            instance_assigned=True,
+        )
+        backend = Mock()
+        backend.compute.return_value.is_instance_present.return_value = False
+
+        async def get_backend(project, backend_type):
+            assert len(project.backends) == 1
+            assert backend_type == BackendType.RUNPOD
+            return backend
+
+        with (
+            patch("dstack._internal.server.services.runner.pool.SSHTunnel") as ssh_tunnel_cls,
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_running."
+                "backends_services.get_project_backend_by_type",
+                new=AsyncMock(side_effect=get_backend),
+            ),
+        ):
+            ssh_tunnel_cls.side_effect = SSHError
+            await _process_job(session, worker, job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.INTERRUPTED_BY_NO_CAPACITY
+        assert job.termination_reason_message == "Provider reports the spot instance is absent"
+        assert job.disconnected_at is None
+        backend.compute.return_value.is_instance_present.assert_called_once_with(
+            instance_id="instance_id",
+            region="US-WA-1",
+            backend_data=None,
+        )
+
     @pytest.mark.parametrize(
         (
             "inactivity_duration",

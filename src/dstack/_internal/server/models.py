@@ -442,6 +442,8 @@ class RunModel(PipelineModelMixin, BaseModel):
     """`resubmission_attempt` counts consecutive transitions to pending without provisioning.
     It can be used to choose a retry delay based on the attempt number.
     """
+    retry_state: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    """Compact event counters and first-event timestamps retained independently of job history."""
     run_spec: Mapped[str] = mapped_column(Text)
     service_spec: Mapped[Optional[str]] = mapped_column(Text)
     priority: Mapped[int] = mapped_column(Integer, default=0)
@@ -586,6 +588,8 @@ class JobModel(PipelineModelMixin, BaseModel):
     should be processed only one-by-one.
     """
     image_pull_progress: Mapped[Optional[str]] = mapped_column(Text)
+    image_readiness: Mapped[Optional[str]] = mapped_column(Text)
+    """Persisted pre-create image readiness snapshot for this job submission."""
 
     __table_args__ = (
         Index(
@@ -970,6 +974,11 @@ class VolumeModel(PipelineModelMixin, BaseModel):
 
     project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
     project: Mapped["ProjectModel"] = relationship(foreign_keys=[project_id])
+
+    run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    """The logical run that owns an automatically managed run volume."""
 
     created_at: Mapped[datetime] = mapped_column(NaiveDateTime, default=get_current_datetime)
     last_processed_at: Mapped[datetime] = mapped_column(

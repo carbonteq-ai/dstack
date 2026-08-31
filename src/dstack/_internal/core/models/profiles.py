@@ -126,6 +126,9 @@ class ProfileRetryConfig(CoreConfig):
             schema["properties"]["duration"],
             extra_types=[{"type": "string"}],
         )
+        schema["properties"]["duration_by_event"]["additionalProperties"] = {
+            "anyOf": [{"type": "integer"}, {"type": "string"}]
+        }
 
 
 class ProfileRetry(generate_dual_core_model(ProfileRetryConfig)):
@@ -144,13 +147,35 @@ class ProfileRetry(generate_dual_core_model(ProfileRetryConfig)):
         Field(
             description=(
                 "The maximum period of retrying the run, e.g., `4h` or `1d`."
-                " The period is calculated as a run age for `no-capacity` event"
-                " and as a time passed since the last `interruption` and `error` for `interruption` and `error` events."
+                " This is the fallback for events omitted from `duration_by_event`."
             )
         ),
     ] = None
+    duration_by_event: Dict[RetryEvent, int] = Field(
+        default_factory=dict,
+        description=(
+            "Optional retry period per event. `no-capacity` is measured from initial submission;"
+            " provisioned events are measured from their first occurrence and do not reset."
+        ),
+    )
+    max_attempts_by_event: Dict[RetryEvent, int] = Field(
+        default_factory=dict,
+        description="Optional maximum number of accepted recovery actions per event.",
+    )
 
     _validate_duration = validator("duration", pre=True, allow_reuse=True)(parse_duration)
+
+    @validator("duration_by_event", pre=True)
+    def _validate_duration_by_event(cls, value):
+        if value is None:
+            return {}
+        return {event: parse_duration(duration) for event, duration in value.items()}
+
+    @validator("max_attempts_by_event")
+    def _validate_max_attempts_by_event(cls, value):
+        if any(attempts < 0 for attempts in value.values()):
+            raise ValueError("retry max attempts cannot be negative")
+        return value
 
     @root_validator
     def _validate_fields(cls, values):

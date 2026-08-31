@@ -14,6 +14,7 @@ from dstack._internal.core.backends.runpod.models import (
     RunpodCreds,
     RunpodStoredConfig,
 )
+from dstack._internal.core.errors import ConfigurationError
 from dstack._internal.core.models.backends.base import BackendType
 
 
@@ -27,6 +28,18 @@ class RunpodConfigurator(
     BACKEND_CLASS = RunpodBackend
 
     def validate_config(self, config: RunpodBackendConfigWithCreds, default_creds_enabled: bool):
+        if (
+            config.provisioning_precondition is None
+            and config.creds.provisioning_precondition is not None
+        ):
+            raise ConfigurationError(
+                "provisioning_precondition credentials require provisioning_precondition config"
+            )
+        if (
+            config.provisioning_precondition is not None
+            and config.creds.provisioning_precondition is None
+        ):
+            raise ConfigurationError("provisioning_precondition requires bearer credentials")
         self._validate_runpod_api_key(config.creds.api_key)
 
     def create_backend(

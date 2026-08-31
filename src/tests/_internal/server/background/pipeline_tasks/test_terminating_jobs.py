@@ -11,6 +11,7 @@ from sqlalchemy.orm import joinedload
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.configurations import TaskConfiguration
 from dstack._internal.core.models.instances import InstanceStatus
+from dstack._internal.core.models.profiles import DEFAULT_STOP_DURATION, Profile
 from dstack._internal.core.models.runs import JobStatus, JobTerminationReason
 from dstack._internal.core.models.volumes import VolumeStatus
 from dstack._internal.server.background.pipeline_tasks.jobs_terminating import (
@@ -21,6 +22,7 @@ from dstack._internal.server.background.pipeline_tasks.jobs_terminating import (
     _get_related_instance_lock_owner,
 )
 from dstack._internal.server.models import InstanceModel, JobModel, VolumeAttachmentModel
+from dstack._internal.server.services.jobs import get_job_spec
 from dstack._internal.server.testing.common import (
     ComputeMockSpec,
     create_instance,
@@ -288,7 +290,83 @@ class TestJobTerminatingWorker:
 
         remove_server_connection_mock.assert_awaited_once_with(job.id)
 
+    @pytest.mark.parametrize("stop_duration", [0, 37])
     async def test_stops_job_gracefully_before_terminating_container(
+        self,
+        test_db,
+        session: AsyncSession,
+        worker: JobTerminatingWorker,
+        stop_duration: int,
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            status=InstanceStatus.BUSY,
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=get_run_spec(
+                repo_id=repo.name,
+                profile=Profile(name="bounded-stop", stop_duration=stop_duration),
+            ),
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.TERMINATING,
+            termination_reason=JobTerminationReason.TERMINATED_BY_USER,
+            job_provisioning_data=get_job_provisioning_data(dockerized=True),
+            instance=instance,
+        )
+        job.graceful_termination_attempts = 0
+        _lock_job(job)
+        await session.commit()
+
+        stopped_at = datetime(2026, 7, 27, tzinfo=timezone.utc)
+        with (
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_terminating."
+                "get_current_datetime",
+                return_value=stopped_at,
+            ),
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_terminating.stop_runner",
+                new=AsyncMock(),
+            ) as stop_runner,
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_terminating._stop_container",
+                new=AsyncMock(return_value=True),
+            ) as stop_container,
+        ):
+            await worker.process(_job_to_pipeline_item(job))
+
+        stop_runner.assert_awaited_once()
+        stop_container.assert_not_awaited()
+
+        await session.refresh(job)
+        await session.refresh(instance)
+        assert job.status == JobStatus.TERMINATING
+        assert job.graceful_termination_attempts == 1
+        assert job.remove_at == stopped_at + timedelta(seconds=stop_duration)
+        assert job.instance_id == instance.id
+        assert job.volumes_detached_at is None
+        assert job.lock_token is None
+        assert job.lock_expires_at is None
+        assert job.lock_owner is None
+        assert instance.lock_token is None
+        assert instance.lock_expires_at is None
+        assert instance.lock_owner is None
+
+        events = await list_events(session)
+        assert any(event.message == "Graceful job stop requested" for event in events)
+
+    async def test_uses_default_duration_for_legacy_unbounded_job(
         self, test_db, session: AsyncSession, worker: JobTerminatingWorker
     ):
         project = await create_project(session=session)
@@ -308,41 +386,30 @@ class TestJobTerminatingWorker:
             job_provisioning_data=get_job_provisioning_data(dockerized=True),
             instance=instance,
         )
+        job_spec = get_job_spec(job)
+        job_spec.stop_duration = None
+        job.job_spec_data = job_spec.json()
         job.graceful_termination_attempts = 0
         _lock_job(job)
         await session.commit()
 
+        stopped_at = datetime(2026, 7, 27, tzinfo=timezone.utc)
         with (
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_terminating."
+                "get_current_datetime",
+                return_value=stopped_at,
+            ),
             patch(
                 "dstack._internal.server.background.pipeline_tasks.jobs_terminating.stop_runner",
                 new=AsyncMock(),
             ) as stop_runner,
-            patch(
-                "dstack._internal.server.background.pipeline_tasks.jobs_terminating._stop_container",
-                new=AsyncMock(return_value=True),
-            ) as stop_container,
         ):
             await worker.process(_job_to_pipeline_item(job))
 
         stop_runner.assert_awaited_once()
-        stop_container.assert_not_awaited()
-
         await session.refresh(job)
-        await session.refresh(instance)
-        assert job.status == JobStatus.TERMINATING
-        assert job.graceful_termination_attempts == 1
-        assert job.remove_at is not None
-        assert job.instance_id == instance.id
-        assert job.volumes_detached_at is None
-        assert job.lock_token is None
-        assert job.lock_expires_at is None
-        assert job.lock_owner is None
-        assert instance.lock_token is None
-        assert instance.lock_expires_at is None
-        assert instance.lock_owner is None
-
-        events = await list_events(session)
-        assert any(event.message == "Graceful job stop requested" for event in events)
+        assert job.remove_at == stopped_at + timedelta(seconds=DEFAULT_STOP_DURATION)
 
     async def test_terminates_gracefully_stopped_job_after_remove_at(
         self, test_db, session: AsyncSession, worker: JobTerminatingWorker

@@ -105,6 +105,7 @@ def get_provisioning_deadline(
     timeout_interval = get_provisioning_timeout(
         backend_type=job_provisioning_data.get_base_backend(),
         instance_type_name=job_provisioning_data.instance_type.name,
+        configured_seconds=job_provisioning_data.provisioning_timeout_seconds,
     )
     return instance_model.started_at + timeout_interval
 

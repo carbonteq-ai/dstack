@@ -1,3 +1,4 @@
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass
@@ -120,7 +121,9 @@ def _is_ready_for_resubmission(run_model: RunModel) -> bool:
         return True
     last_processed_at = max(job.last_processed_at for job in run_model.jobs)
     duration_since_processing = get_current_datetime() - last_processed_at
-    return duration_since_processing >= _get_retry_delay(run_model.resubmission_attempt)
+    return duration_since_processing >= _get_retry_delay(
+        run_model.resubmission_attempt, run_model.id
+    )
 
 
 # We use exponentially increasing retry delays for pending runs.
@@ -136,7 +139,14 @@ _PENDING_RETRY_DELAYS = [
 ]
 
 
-def _get_retry_delay(resubmission_attempt: int) -> timedelta:
+def _get_retry_delay(resubmission_attempt: int, run_id: uuid.UUID) -> timedelta:
     if resubmission_attempt - 1 < len(_PENDING_RETRY_DELAYS):
-        return _PENDING_RETRY_DELAYS[resubmission_attempt - 1]
-    return _PENDING_RETRY_DELAYS[-1]
+        base_delay = _PENDING_RETRY_DELAYS[resubmission_attempt - 1]
+    else:
+        base_delay = _PENDING_RETRY_DELAYS[-1]
+    # Stable per run and attempt so repeated pipeline polling does not move the
+    # deadline. The base schedule remains capped at ten minutes.
+    digest = hashlib.sha256(f"{run_id}:{resubmission_attempt}".encode()).digest()
+    unit_interval = int.from_bytes(digest[:8], "big") / (2**64 - 1)
+    jitter_factor = 0.8 + 0.4 * unit_interval
+    return base_delay * jitter_factor

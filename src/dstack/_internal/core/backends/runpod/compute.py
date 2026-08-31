@@ -1,31 +1,40 @@
+import hashlib
 import json
+import time
 import uuid
 from collections.abc import Iterable
+from dataclasses import asdict
 from datetime import timedelta
 from typing import Callable, List, Optional
 
+import gpuhunt
+import requests
+from gpuhunt.providers.runpod import RunpodProvider
+
 from dstack._internal.core.backends.base.backend import Compute
 from dstack._internal.core.backends.base.compute import (
-    ComputeWithAllOffersCached,
+    ComputeWithFilteredOffersCached,
     ComputeWithGroupProvisioningSupport,
     ComputeWithMultinodeSupport,
     ComputeWithVolumeSupport,
     generate_unique_instance_name,
-    generate_unique_volume_name,
     get_docker_commands,
     get_job_instance_name,
 )
 from dstack._internal.core.backends.base.models import JobConfiguration
 from dstack._internal.core.backends.base.offers import (
     OfferModifier,
+    catalog_item_to_offer,
     get_catalog_offers,
     get_offers_disk_modifier,
+    requirements_to_query_filter,
 )
 from dstack._internal.core.backends.runpod.api_client import RunpodApiClient, RunpodApiClientError
 from dstack._internal.core.backends.runpod.models import RunpodConfig
 from dstack._internal.core.consts import DSTACK_RUNNER_SSH_PORT
 from dstack._internal.core.errors import (
     ComputeError,
+    ProvisioningError,
 )
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.common import CoreModel, RegistryAuth
@@ -33,6 +42,7 @@ from dstack._internal.core.models.compute_groups import ComputeGroup, ComputeGro
 from dstack._internal.core.models.instances import (
     InstanceAvailability,
     InstanceConfiguration,
+    InstanceOffer,
     InstanceOfferWithAvailability,
     SSHKey,
 )
@@ -44,6 +54,7 @@ from dstack._internal.core.models.volumes import (
     Volume,
     VolumeProvisioningData,
 )
+from dstack._internal.core.services import is_valid_dstack_resource_name
 from dstack._internal.utils.common import get_current_datetime, get_or_error
 from dstack._internal.utils.logging import get_logger
 
@@ -60,10 +71,11 @@ CONFIGURABLE_DISK_SIZE = Range[Memory](min=Memory.parse("1GB"), max=None)
 
 class RunpodOfferBackendData(CoreModel):
     pod_counts: Optional[list[int]] = None
+    stock_status: Optional[str] = None
 
 
 class RunpodCompute(
-    ComputeWithAllOffersCached,
+    ComputeWithFilteredOffersCached,
     ComputeWithVolumeSupport,
     ComputeWithMultinodeSupport,
     ComputeWithGroupProvisioningSupport,
@@ -76,13 +88,25 @@ class RunpodCompute(
         self.config = config
         self.api_client = RunpodApiClient(config.creds.api_key)
 
-    def get_all_offers_with_availability(self) -> List[InstanceOfferWithAvailability]:
-        offers = get_catalog_offers(
-            backend=BackendType.RUNPOD,
-            locations=self.config.regions or None,
-            requirements=None,
-            extra_filter=lambda o: _is_secure_cloud(o.region) or self.config.allow_community_cloud,
-        )
+    def get_offers_by_requirements(
+        self, requirements: Requirements
+    ) -> List[InstanceOfferWithAvailability]:
+        if _should_query_live_gpu_offers(requirements):
+            offers = _get_live_gpu_offers(
+                requirements=requirements,
+                regions=self.config.regions,
+                allow_community_cloud=self.config.allow_community_cloud,
+                gpu_availability=self.api_client.get_data_center_gpu_availability(),
+                minimum_stock_status=self.config.minimum_stock_status,
+            )
+        else:
+            offers = get_catalog_offers(
+                backend=BackendType.RUNPOD,
+                locations=self.config.regions or None,
+                requirements=requirements,
+                extra_filter=lambda o: _is_secure_cloud(o.region)
+                or self.config.allow_community_cloud,
+            )
         offers = [
             offer.with_availability(availability=InstanceAvailability.AVAILABLE)
             for offer in offers
@@ -238,7 +262,17 @@ class RunpodCompute(
             dockerized=False,
             ssh_proxy=None,
             backend_data=None,
+            provisioning_timeout_seconds=self.config.provisioning_timeout_seconds,
+            provisioning_started_at=get_current_datetime(),
         )
+
+    def is_instance_present(
+        self,
+        instance_id: str,
+        region: str,
+        backend_data: Optional[str] = None,
+    ) -> Optional[bool]:
+        return self.api_client.get_pod(instance_id) is not None
 
     def run_jobs(
         self,
@@ -333,6 +367,8 @@ class RunpodCompute(
                 price=instance_offer.price,
                 username="root",
                 dockerized=False,
+                provisioning_timeout_seconds=self.config.provisioning_timeout_seconds,
+                provisioning_started_at=get_current_datetime(),
             )
             for pod in resp["pods"]
         ]
@@ -376,7 +412,11 @@ class RunpodCompute(
     ):
         instance_id = provisioning_data.instance_id
         pod = self.api_client.get_pod(instance_id)
-        if pod is None or pod["runtime"] is None:
+        if pod is None:
+            raise ProvisioningError(
+                f"RunPod Pod {instance_id} no longer exists during provisioning"
+            )
+        if pod["runtime"] is None:
             return
         ports = pod["runtime"].get("ports")
         if ports is None:
@@ -405,16 +445,38 @@ class RunpodCompute(
 
     def create_volume(self, volume: Volume) -> VolumeProvisioningData:
         assert isinstance(volume.configuration, RunpodVolumeConfiguration)
-        volume_name = generate_unique_volume_name(volume, max_length=MAX_RESOURCE_NAME_LEN)
         size_gb = volume.configuration.size_gb
         # Runpod regions must be uppercase.
         # Lowercase regions are accepted in the API but they break Runpod in several ways.
         region = volume.configuration.region.upper()
-        volume_id = self.api_client.create_network_volume(
-            name=volume_name,
-            region=region,
-            size=size_gb,
-        )
+        volume_name = _get_runpod_volume_name(volume, region)
+        volume_id = self._find_existing_volume_id(volume_name, region, size_gb)
+        if volume_id is None:
+            try:
+                volume_id = self.api_client.create_network_volume(
+                    name=volume_name,
+                    region=region,
+                    size=size_gb,
+                )
+            except requests.RequestException:
+                # RunPod may finish createNetworkVolume after returning an HTTP
+                # 500. Reconcile the deterministic provider name before
+                # reporting failure; a later retry can adopt the same volume.
+                for delay in (0, 1, 2, 4, 8):
+                    if delay:
+                        time.sleep(delay)
+                    try:
+                        volume_id = self._find_existing_volume_id(volume_name, region, size_gb)
+                    except requests.RequestException:
+                        continue
+                    if volume_id is not None:
+                        logger.info(
+                            "Reconciled RunPod volume %s after an ambiguous create response",
+                            volume_name,
+                        )
+                        break
+                else:
+                    raise
         return VolumeProvisioningData(
             backend=BackendType.RUNPOD,
             volume_id=volume_id,
@@ -423,6 +485,19 @@ class RunpodCompute(
             attachable=False,
             detachable=False,
         )
+
+    def _find_existing_volume_id(self, name: str, region: str, size_gb: int) -> Optional[str]:
+        matches = self.api_client.get_network_volumes_by_name(name)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ComputeError(f"Multiple RunPod volumes found with deterministic name {name}")
+        volume = matches[0]
+        actual_region = volume["dataCenter"]["id"].upper()
+        actual_size_gb = int(volume["size"])
+        if actual_region != region or actual_size_gb != size_gb:
+            raise ComputeError(f"RunPod volume {name} conflicts with requested region or size")
+        return volume["id"]
 
     def delete_volume(self, volume: Volume):
         if volume.volume_id is not None:
@@ -488,3 +563,96 @@ def _get_offer_pod_counts(offer: InstanceOfferWithAvailability) -> list[int]:
     )
     pod_counts = backend_data.pod_counts or []
     return pod_counts
+
+
+class _RunpodLiveGPUProvider(RunpodProvider):
+    """Bound RunPod's live catalog query to the GPU counts and locations a run can use."""
+
+    def __init__(
+        self,
+        gpu_counts: range,
+        regions: Optional[List[str]],
+        allow_community_cloud: bool,
+    ) -> None:
+        self._gpu_counts = set(gpu_counts)
+        self._regions = set(regions or [])
+        self._allow_community_cloud = allow_community_cloud
+        super().__init__()
+
+    def _build_query_variables(self) -> list[dict]:
+        variables = super()._build_query_variables()
+        bounded = []
+        for variable in variables:
+            lowest_price = variable["lowestPriceInput"]
+            if lowest_price["gpuCount"] not in self._gpu_counts:
+                continue
+            if not self._allow_community_cloud and not lowest_price["secureCloud"]:
+                continue
+            location = lowest_price.get("dataCenterId") or lowest_price.get("countryCode")
+            if self._regions and location not in self._regions:
+                continue
+            bounded.append(variable)
+        return bounded
+
+    def _fetch_cluster_offers(self) -> list[gpuhunt.RawCatalogItem]:
+        return []
+
+    def _fetch_cpu_offers(self) -> list[gpuhunt.RawCatalogItem]:
+        return []
+
+
+def _should_query_live_gpu_offers(requirements: Requirements) -> bool:
+    gpu = requirements.resources.gpu
+    return (
+        not requirements.multinode
+        and requirements.spot is not False
+        and gpu is not None
+        and (gpu.count.min or 0) > 0
+    )
+
+
+def _get_runpod_volume_name(volume: Volume, region: str) -> str:
+    prefix = f"dstack-{volume.name}"
+    if volume.project_name and is_valid_dstack_resource_name(volume.project_name):
+        prefix = f"dstack-{volume.project_name}-{volume.name}"
+    suffix = hashlib.sha256(f"{volume.id}:{region}".encode()).hexdigest()[:8]
+    prefix = prefix[: MAX_RESOURCE_NAME_LEN - len(suffix) - 1]
+    return f"{prefix}-{suffix}"
+
+
+def _get_live_gpu_offers(
+    requirements: Requirements,
+    regions: Optional[List[str]],
+    allow_community_cloud: bool,
+    gpu_availability: dict[str, dict[str, str]],
+    minimum_stock_status: str = "low",
+) -> List[InstanceOffer]:
+    gpu = get_or_error(requirements.resources.gpu)
+    min_gpu_count = gpu.count.min or 1
+    max_gpu_count = gpu.count.max or min_gpu_count
+    provider = _RunpodLiveGPUProvider(
+        gpu_counts=range(min_gpu_count, max_gpu_count + 1),
+        regions=regions,
+        allow_community_cloud=allow_community_cloud,
+    )
+    query_filter = requirements_to_query_filter(requirements)
+    offers = []
+    for raw_item in RunpodProvider.filter(provider.get(query_filter=query_filter)):
+        item = gpuhunt.CatalogItem(provider=BackendType.RUNPOD.value, **asdict(raw_item))
+        if not gpuhunt.matches(item, q=query_filter):
+            continue
+        offer = catalog_item_to_offer(
+            backend=BackendType.RUNPOD,
+            item=item,
+            requirements=requirements,
+            configurable_disk_size=CONFIGURABLE_DISK_SIZE,
+        )
+        if offer is not None:
+            stock_status = gpu_availability.get(offer.region, {}).get(offer.instance.name, "")
+            stock_rank = {"low": 1, "medium": 2, "high": 3}.get(stock_status.lower(), 0)
+            minimum_stock_rank = {"low": 1, "medium": 2, "high": 3}[minimum_stock_status]
+            if stock_rank < minimum_stock_rank:
+                continue
+            offer.backend_data = RunpodOfferBackendData(stock_status=stock_status).dict()
+            offers.append(offer)
+    return offers
