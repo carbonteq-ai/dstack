@@ -1,5 +1,6 @@
 import copy
 import json
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Union
 from unittest.mock import AsyncMock, Mock, patch
@@ -49,6 +50,7 @@ from dstack._internal.core.models.users import GlobalRole, ProjectRole
 from dstack._internal.core.models.volumes import InstanceMountPoint, MountPoint
 from dstack._internal.server.models import JobModel, RunModel
 from dstack._internal.server.schemas.runs import MAX_JOB_SUBMISSIONS_LIMIT, ApplyRunPlanRequest
+from dstack._internal.server.services.plugins import _PLUGINS
 from dstack._internal.server.services.projects import add_project_member
 from dstack._internal.server.services.resources import (
     set_gpu_vendor_default,
@@ -79,6 +81,7 @@ from dstack._internal.server.testing.common import (
     list_events,
 )
 from dstack._internal.server.testing.matchers import SomeUUID4Str
+from dstack.plugins import ApplyPolicy, Plugin
 
 pytestmark = pytest.mark.usefixtures("image_config_mock", "disable_sshproxy")
 
@@ -3557,6 +3560,90 @@ class TestSubmitRun:
             json=body,
         )
         assert response.status_code == 400
+
+    # CarbonTeq delta coverage: the deprecated /submit route must go through
+    # apply policies. It reaches runs.submit_run() directly, which — unlike
+    # runs.apply_plan() — does not apply them, so without the route-level call
+    # any project member could use it to bypass admission control entirely.
+    # See CARBONTEQ_FORK.md.
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite"], indirect=True)
+    async def test_applies_plugin_policies_that_reject(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(run_name="test-run", repo_id=repo.name)
+
+        with _plugin_policy(_RejectingPolicy()):
+            response = await client.post(
+                f"/api/project/{project.name}/runs/submit",
+                headers=get_auth_headers(user.token),
+                json={"run_spec": run_spec.dict()},
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"][0]["msg"] == "rejected by policy"
+        res = await session.execute(select(RunModel))
+        assert res.scalar_one_or_none() is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite"], indirect=True)
+    async def test_persists_the_spec_a_plugin_policy_returns(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(run_name="test-run", repo_id=repo.name)
+        run_spec.configuration.priority = 0
+
+        with _plugin_policy(_PriorityRewritingPolicy()):
+            response = await client.post(
+                f"/api/project/{project.name}/runs/submit",
+                headers=get_auth_headers(user.token),
+                json={"run_spec": run_spec.dict()},
+            )
+
+        assert response.status_code == 200
+        res = await session.execute(select(RunModel))
+        assert res.scalar_one().priority == 42
+
+
+class _RejectingPolicy(ApplyPolicy):
+    def on_run_apply(self, user: str, project: str, spec: RunSpec) -> RunSpec:
+        raise ValueError("rejected by policy")
+
+
+class _PriorityRewritingPolicy(ApplyPolicy):
+    def on_run_apply(self, user: str, project: str, spec: RunSpec) -> RunSpec:
+        spec.configuration.priority = 42
+        return spec
+
+
+class _StubPlugin(Plugin):
+    def __init__(self, policy: ApplyPolicy):
+        self._policy = policy
+
+    def get_apply_policies(self) -> List[ApplyPolicy]:
+        return [self._policy]
+
+
+@contextmanager
+def _plugin_policy(policy: ApplyPolicy):
+    _PLUGINS.append(_StubPlugin(policy))
+    try:
+        yield
+    finally:
+        _PLUGINS.clear()
 
 
 class TestStopRuns:

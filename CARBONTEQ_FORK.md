@@ -97,6 +97,43 @@ that ignores the interrupt for the entire stop duration can outlive the runner's
 own kill until the shim's container stop removes it. That is acceptable because
 both deadlines derive from the same stop duration.
 
+### Apply plugin policies on the deprecated submit route
+
+Upstream calls `apply_plugin_policies()` from `runs.get_plan()` and
+`runs.apply_plan()`, but not from `runs.submit_run()`. The deprecated
+`POST /api/project/{project}/runs/submit` route calls `runs.submit_run()`
+directly, so a request to it skips every server-side apply policy. The route is
+gated only by `ProjectMember()`, which admits any project role, so any member's
+token could submit a run that bypassed admission control entirely. That reduces
+the CarbonTeq policy layer — compute windows, run-duration ceilings, the cloud
+permission flag and priority bands — from enforced to advisory.
+
+The candidate delta, all in
+`src/dstack/_internal/server/routers/runs.py`:
+
+- applies plugin policies to `body.run_spec` inside the `submit_run` route
+  before delegating to `runs.submit_run()`; and
+- re-parses the returned spec, matching how `get_plan()` and `apply_plan()`
+  handle a policy's return value.
+
+The call belongs in the route rather than in `runs.submit_run()` because
+`apply_plan()` has already applied policies by the time it calls that function.
+A second pass there would re-apply them to an already-modified spec, which for a
+band-mapped `priority` would move the value again.
+
+The route is kept rather than deleted. Deleting it would close the same hole,
+but roughly twenty existing upstream tests exercise it, and carrying that diff
+through a 4,000-line test file is more rebase surface than the nineteen lines
+this costs.
+
+Regression coverage is `TestSubmitRun::test_applies_plugin_policies_that_reject`
+and `TestSubmitRun::test_persists_the_spec_a_plugin_policy_returns` in
+`src/tests/_internal/server/routers/test_runs.py`. Both were confirmed to fail
+with the delta reverted.
+
+The design this supports is recorded in `CARBONTEQ_POLICY.md`; the policy plugin
+itself lives in `policy/` and is additive, so it carries no rebase surface.
+
 ## Compatibility and release
 
 Build the server, runner, and shim from the same fork commit and give the
@@ -136,6 +173,19 @@ cancel path as one conflict-sensitive unit. Run all tests above plus the live
 cancellation gate. Retire the fork only after an upstream release propagates
 the same bounded value through both server and runner and passes the CarbonTeq
 qualification unchanged.
+
+The submit-route delta is a separate unit. Inspect the runs router alongside
+`runs.submit_run()` and `runs.apply_plan()`: the delta is only needed while
+`submit_run()` itself does not apply policies, and only correct while
+`apply_plan()` still does. Retire it if upstream either removes the deprecated
+route or moves the policy call into `submit_run()` — and in the latter case
+remove the route-level call, or policies will be applied twice.
+
+Because the plugin hook is upstream-experimental, also re-check
+`ApplyPolicy.on_run_apply`'s signature on every rebase. `policy/` imports from
+`dstack._internal` only through `policy/src/ctpolicy/_compat.py`, so a moved
+symbol surfaces there; run `uv run pytest policy/tests` as part of the rebase
+gate.
 
 Published fork commit: branch `codex/graceful-cancellation-stop-duration`
 (record the exact head SHA in the consumer repository after publication).

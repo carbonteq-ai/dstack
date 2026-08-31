@@ -5,7 +5,7 @@ from packaging.version import Version
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dstack._internal.core.errors import ResourceNotExistsError
-from dstack._internal.core.models.runs import Run, RunPlan
+from dstack._internal.core.models.runs import Run, RunPlan, RunSpec
 from dstack._internal.server.compatibility.runs import patch_run, patch_run_plan
 from dstack._internal.server.db import get_session
 from dstack._internal.server.models import ProjectModel, UserModel
@@ -22,6 +22,7 @@ from dstack._internal.server.schemas.runs import (
 from dstack._internal.server.security.permissions import Authenticated, ProjectMember
 from dstack._internal.server.services import runs, users
 from dstack._internal.server.services.pipelines import PipelineHinterProtocol, get_pipeline_hinter
+from dstack._internal.server.services.plugins import apply_plugin_policies
 from dstack._internal.server.utils.routers import (
     CustomORJSONResponse,
     get_base_api_additional_responses,
@@ -219,10 +220,26 @@ async def submit_run(
     pipeline_hinter: PipelineHinterProtocol = Depends(get_pipeline_hinter),
 ) -> Run:
     user, project = user_project
+    # CarbonTeq delta: apply plugin policies here.
+    #
+    # `runs.submit_run()` does not call `apply_plugin_policies()` — only
+    # `runs.apply_plan()` does. This route reaches `submit_run()` directly, so
+    # without this any project member's token could submit a run that skipped
+    # every server-side apply policy, leaving admission control advisory. The
+    # call belongs here rather than inside `submit_run()` because `apply_plan()`
+    # has already applied policies by the time it calls that function, and a
+    # second pass would re-apply them to an already-modified spec.
+    # See CARBONTEQ_FORK.md and CARBONTEQ_POLICY.md.
+    run_spec = await apply_plugin_policies(
+        user=user.name,
+        project=project.name,
+        spec=body.run_spec,
+    )
+    run_spec = RunSpec.parse_obj(run_spec.dict())
     return await runs.submit_run(
         session=session,
         user=user,
         project=project,
-        run_spec=body.run_spec,
+        run_spec=run_spec,
         pipeline_hinter=pipeline_hinter,
     )

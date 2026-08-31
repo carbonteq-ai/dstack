@@ -93,6 +93,30 @@ curl -sI "http://<dokploy-vm-lan-ip>:8080/<version>/binaries/dstack-runner-linux
 
 A 404 or timeout here means the rollout will silently never happen.
 
+Two files in this directory are bind-mounted into the server and are part of the
+deployment, not just examples — **edit them before the first deploy**:
+
+| File | Mounted at | Reloaded |
+| --- | --- | --- |
+| `config.yml` | `/root/.dstack/server/config.yml` (read-only) | at boot only |
+| `policy.yaml` | `/etc/ctpolicy/policy.yaml` (read-only) | on change |
+
+`config.yml` declares the projects, the default permissions and the enabled
+plugins. It is read-only on purpose: with the file present the server takes the
+`apply_config()` path, and `init_config()` — which would write a generated
+`main`-only config over it — never runs.
+
+That bind sits *inside* the `server-data` volume's mount point. Docker applies
+mounts in order of destination depth so the file lands on top of the volume, but
+confirm it rather than assuming:
+
+```
+docker compose exec server head -3 /root/.dstack/server/config.yml
+```
+
+If that shows a generated config instead of the commented one from this
+directory, the mount did not take and no policy is being enforced.
+
 ## 5. Enrol the worker
 
 ```
@@ -140,6 +164,59 @@ retry: false
 `graceful-stop-complete` is the fork working. Being killed at ten seconds means
 the worker is still on upstream binaries; check the binaries URL and that you
 bumped the version.
+
+## 7. Set up teams and policy
+
+The policy layer turns this single-project MVP into one project per team sharing
+the one SSH fleet. The design and its rationale are in `../../../CARBONTEQ_POLICY.md`;
+the plugin's own reference is `../../../policy/README.md`.
+
+`main` stays the fleet-owning project. Project names are immutable and fleets
+cannot move between projects, so renaming it to `infra` is not an option — and
+keeping it leaves the enrolled worker, the binaries rollout and the cancellation
+smoke test untouched. People stop running in `main`; they run in their team project.
+
+**a. Declare the teams.** Edit `config.yml`, then redeploy so `apply_config()`
+creates the projects. Cloud backends belong only in the projects whose teams may
+use NeoCloud — a project listed with no `backends:` has all of its backends
+removed on every boot, which is the structural half of the cloud gate.
+
+**b. Share the fleet.** From an account with the global admin token:
+
+```
+dstack export create shared-hw --fleet mvp-workers --global
+```
+
+A global export is auto-imported into every project, including ones created
+later. Confirm from a team project:
+
+```
+dstack fleet list --include-imported
+```
+
+**c. Write the policy.** Edit `policy.yaml` so every team in `config.yml` has an
+entry and every engineer is listed under their team's `users`. Both are
+fail-closed: an unlisted project and an unlisted user are rejected at submission.
+
+**d. Add members.** Give each engineer membership in their team project only.
+Membership is dstack's own; there is no parallel list to maintain.
+
+**e. Check it took.** The server logs `Loaded plugin ctpolicy` at startup — if it
+does not, nothing is being enforced. Then, as a team member:
+
+```
+dstack apply -f task.dstack.yml    # plan table shows the clamped
+                                   # max_duration / max_price / priority
+dstack ps                          # shows only this team's runs
+```
+
+Outside the team's window, the same apply is rejected with the schedule and the
+next opening.
+
+> The build installs `ctpolicy` with `--no-deps` alongside the dstack wheel, so
+> the package must never grow a dependency; see `policy/README.md`. Budgets, the
+> background enforcer and the `dstack-quota` companion command are later phases
+> and are not in this build.
 
 ## Notes
 

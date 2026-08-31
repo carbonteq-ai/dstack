@@ -1,0 +1,53 @@
+# CarbonTeq dstack server config.
+#
+# Applied once at server boot by ServerConfigManager.apply_config()
+# (src/dstack/_internal/server/services/config.py). It creates any missing
+# project, reconciles each project's backends, sets the default permissions and
+# loads the enabled plugins.
+#
+# Mounted READ-ONLY at /root/.dstack/server/config.yml. That matters: with the
+# file present, the server takes the apply_config() path and never runs
+# init_config(), which would otherwise overwrite this with a generated
+# `main`-only config. sync_config() is already a no-op upstream, so nothing
+# writes back over it.
+#
+# NOT hot-reloaded. Changing this file requires a server restart. The policy
+# layer's own rules live in policy.yaml, which IS hot-reloaded.
+
+projects:
+  # Infra project. Owns the SSH fleet and shares it with every team project via
+  # a global export:
+  #
+  #     dstack export create shared-hw --fleet mvp-workers --global
+  #
+  # `main` is auto-created by the server on first boot and project names are
+  # immutable (update_project changes only is_public/templates_repo), so the
+  # fleet-owning project keeps this name rather than being renamed to `infra`.
+  # People do not run here; they run in their team project.
+  - name: main
+
+  # Team projects. The project name IS the team identity: it is what the policy
+  # plugin receives as its `project` argument and what keys `teams:` in
+  # policy.yaml. Membership is dstack's own MemberModel — add people with
+  # `dstack project` / the UI, not with a config file.
+  #
+  # A project listed with no `backends:` has ALL of its backends deleted on every
+  # boot (_apply_project_config computes backends_to_delete from the full set of
+  # available types). That is the structural half of the "may this team use
+  # NeoCloud" flag: a team with no cloud backend cannot provision cloud at all,
+  # and adding one requires ProjectAdmin. The policy plugin enforces the same
+  # rule again at admission, so neither half is load-bearing alone.
+  - name: team-research
+  - name: team-platform
+  - name: team-infra
+
+default_permissions:
+  # Teams must not be able to create projects for themselves; a project is a
+  # team, and creating one would create an ungoverned team.
+  allow_non_admins_create_projects: false
+  # Without this, any ProjectRole.USER can add and delete SSH fleets, including
+  # other people's. Restricts it to project admins.
+  allow_non_admins_manage_ssh_fleets: false
+
+plugins:
+  - ctpolicy

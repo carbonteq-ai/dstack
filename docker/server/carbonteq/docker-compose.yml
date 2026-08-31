@@ -59,9 +59,28 @@ services:
       DSTACK_SHIM_VERSION: ${DSTACK_RELEASE_VERSION}
       DSTACK_RUNNER_DOWNLOAD_URL: ${DSTACK_BINARIES_URL:?set the binaries URL}/{version}/binaries/dstack-runner-linux-{arch}
       DSTACK_SHIM_DOWNLOAD_URL: ${DSTACK_BINARIES_URL}/{version}/binaries/dstack-shim-linux-{arch}
+
+      # Where the ctpolicy plugin reads team and user policy from. This is also
+      # the compiled-in default; it is set explicitly so the bind mount below
+      # and the path the plugin reads cannot drift apart.
+      DSTACK_CT_POLICY_FILE: /etc/ctpolicy/policy.yaml
     volumes:
-      # config.yml (backend credentials) + run logs. Postgres holds the rest.
+      # Run logs, and anything else dstack keeps on disk. Postgres holds the rest.
       - server-data:/root/.dstack/server
+      # Projects, default permissions and the enabled plugin list, under version
+      # control rather than generated into the volume. Read-only on purpose: with
+      # the file present the server takes the apply_config() path, and
+      # init_config() — which would write a generated `main`-only config over
+      # it — never runs.
+      #
+      # This bind sits *inside* the server-data volume's mount point. Docker
+      # applies mounts in order of destination depth, so the file lands on top of
+      # the volume. Verify it after the first deploy rather than assuming:
+      #   docker compose exec server head -3 /root/.dstack/server/config.yml
+      - ./config.yml:/root/.dstack/server/config.yml:ro
+      # Team and user policy. Unlike config.yml this IS re-read on change, so an
+      # edit takes effect on the next `dstack apply` without a restart.
+      - ./policy.yaml:/etc/ctpolicy/policy.yaml:ro
     networks:
       # `default` keeps postgres reachable; `dokploy-network` is what Traefik is
       # on, and without it a Dokploy domain answers 502 because the proxy has no
