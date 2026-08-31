@@ -24,8 +24,8 @@ Two deliberate deployment states to know about:
 This document is the decision record. [`CARBONTEQ_FORK.md`](CARBONTEQ_FORK.md)
 remains the rebase ledger for changes inside upstream files;
 [`policy/README.md`](policy/README.md) is the package's own reference; and
-[`docker/server/carbonteq/README.md`](docker/server/carbonteq/README.md) is the
-deployment guide.
+`app/deploy/dstack-server/README.md`, in the control-plane
+repository, is the deployment guide.
 
 ## The problem
 
@@ -239,7 +239,7 @@ first costs one config change and buys certainty that the rules match intent.
 ## Architecture
 
 ```
- docker/server/carbonteq/config.yml   ──►  projects, backends,
+ app/deploy/dstack-server/config.yml  ──►  projects, backends,
    (bind-mounted, read-only)               default_permissions, plugins: [ctpolicy]
                      │                     applied once at boot
  ┌───────────────────┴──────────────────────────────────────────┐

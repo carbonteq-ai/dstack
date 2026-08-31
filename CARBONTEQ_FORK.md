@@ -40,6 +40,32 @@ Do not reintroduce a policy file here. Policy is the control plane's under
 ADR-020 — the schema and the deployed values live in the consumer repository,
 and this tree carries only the deltas that cannot live outside dstack.
 
+## Moved to the control-plane repository
+
+`docker/server/carbonteq/docker-compose.yml`, `config.yml` and `README.md` left
+this tree on 2026-08-31 for `app/deploy/dstack-server/` in the private control-plane
+repository. ADR-024 draws the line at build artifact versus deployment topology:
+those three describe our infrastructure, not dstack's build.
+
+`Dockerfile`, `Dockerfile.binaries` and `version.sh` deliberately **stay**. The
+fork patches the Python server *and* the Go runner, and only a build from this
+tree can guarantee the two match — a mismatch is silent, not loud. Moving
+`version.sh` out would mean passing a version in from outside, reintroducing the
+manual bump this fork removed.
+
+The compose file now builds with `context: ../../../.dstack-ref`, so it consumes
+this tree as a submodule instead of being cloned with it. Two things follow, and
+they are documented there rather than here: the deploy target must check
+submodules out, and `version.sh`'s trick of reading ref metadata out of the build
+context only works while `.dstack-ref/.git` is a directory rather than a
+`gitdir:` pointer file.
+
+Unlike the policy file above, these were deleted in an ordinary commit, not
+purged. They carry no credentials; the deployment README does carry a username
+and spend figures, which were redacted in the copy that moved and remain in this
+branch's history. That was a deliberate scope decision, recorded in the consumer
+repository's `harness/progress.md`.
+
 ## Maintained delta
 
 ### Honor bounded task stop duration
@@ -179,7 +205,7 @@ The MVP deployment enforces this by construction rather than by convention: both
 images derive their version from the commit in the build context, and the
 version the server reports is the one baked into its wheel, so the component set
 cannot silently disagree and no operator has to remember to bump anything. See
-`docker/server/carbonteq/README.md`.
+`app/deploy/dstack-server/README.md` in the control-plane repository.
 
 The supported production path is dstack tasks on Linux AMD64 SSH-fleet workers
 using Docker. The runner sends the interrupt to the launched process, so the
