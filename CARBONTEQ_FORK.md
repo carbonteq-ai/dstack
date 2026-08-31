@@ -18,6 +18,10 @@ rotation implementation is published and deployed at commit
 `a73c3314ab54cbe0e6056f6dad2e33e173596be6`.
 The provider-configurable minimum stock policy is published and deployed at
 commit `ae5dac6576b0f19b49e81b31781f3b9f14e95361`.
+The candidate branch incorporates CarbonTeq default-branch commit
+`b5ff8987f` through merge commit
+`98c75b7f6136fb40420e58a6f3eed476f6aaa088`; this retains the maintained delta
+while including the current gateway-replica and full-offer work.
 
 ## Maintained delta
 
@@ -408,6 +412,15 @@ The ambiguous-create follow-up passes 52 focused RunPod, volume-pipeline,
 managed-storage, rotation, and cooldown tests with 21 PostgreSQL variants
 skipped when PostgreSQL is absent, plus Ruff and `git diff --check`.
 
+After merging current `carbonteq/master`, the release-focused Python matrix
+passed 271 tests with 130 PostgreSQL variants skipped. Five selected
+managed-storage/retry submitted-job tests passed with five PostgreSQL variants
+skipped; the broader submitted-job file still has exactly the same eight known
+SQLite multinode/placement failures and no new failure. Ruff and
+`git diff --check` pass. Go is not installed in this release workstation, so
+the runner executor/schema packages remain a required CI gate rather than a
+locally re-claimed result.
+
 ## Rebase and retirement
 
 Rebase from the exact upstream tag or commit, then inspect the runner payload
@@ -423,5 +436,8 @@ Server Edition. dstack observed submission through `done`, CUDA reported
 97,887 MiB visible VRAM, and fleet deletion left the RunPod account with zero
 active Pods.
 
-Published fork commit: `d0268205c768a01c4573689cc68f041692e476b2` on branch
-`codex/registry-default-auth`.
+Current deployed fork commit:
+`ae5dac6576b0f19b49e81b31781f3b9f14e95361`. Current candidate code merge:
+`98c75b7f6136fb40420e58a6f3eed476f6aaa088` on branch
+`codex/registry-default-auth`; the following ledger-only commit does not alter
+server, runner, or shim bytes.
