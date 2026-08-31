@@ -227,25 +227,59 @@ creates the projects. Cloud backends belong only in the projects whose teams may
 use NeoCloud — a project listed with no `backends:` has all of its backends
 removed on every boot, which is the structural half of the cloud gate.
 
-**b. Share the fleet.** From an account with the global admin token:
+**b. Share the fleet.** Only a global admin can create a global export:
 
 ```
-dstack export create shared-hw --fleet mvp-workers --global
+dstack export --project main create shared-hw --fleet mvp-workers --global
+dstack export --project main list          # IMPORTERS shows * when it is global
 ```
+
+`--project` is registered on the parent parser, so it goes **before** the
+subcommand; `dstack export create ... --project main` fails with "Unrecognized
+arguments". The same is true of `fleet`, `ps` and `import`. `dstack apply` has no
+subcommands, so either position works there.
 
 A global export is auto-imported into every project, including ones created
 later. Confirm from a team project:
 
 ```
-dstack fleet list   # already includes imported fleets; there is no flag
+dstack import --project team-research list   # main/shared-hw | mvp-workers
+dstack fleet  --project team-research        # already includes imported fleets
 ```
 
 **c. Write the policy.** Edit `policy.yaml` so every team in `config.yml` has an
 entry and every engineer is listed under their team's `users`. Both are
 fail-closed: an unlisted project and an unlisted user are rejected at submission.
 
-**d. Add members.** Give each engineer membership in their team project only.
-Membership is dstack's own; there is no parallel list to maintain.
+**d. Add members.** Give each engineer membership in their team project only —
+that is what scopes `dstack ps` and makes another team's runs unnameable.
+
+There is no CLI for this: `dstack project` only edits your local client config,
+and there is no `dstack user` command. Use the web UI, or the API:
+
+```sh
+SERVER=http://<dokploy-vm-lan-ip>:3001
+ADMIN=<DSTACK_SERVER_ADMIN_TOKEN>
+
+curl -sS -X POST "$SERVER/api/users/create" \
+  -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+  -d '{"username":"alice","global_role":"user","email":null,"active":true}'
+
+curl -sS -X POST "$SERVER/api/projects/team-research/add_members" \
+  -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+  -d '{"members":[{"username":"alice","project_role":"user"}]}'
+
+# Their token, to hand over
+curl -sS -X POST "$SERVER/api/users/get_user" \
+  -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+  -d '{"username":"alice"}' |
+  python3 -c 'import sys,json;print(json.load(sys.stdin)["creds"]["token"])'
+```
+
+Use `project_role: user`, not `admin`: a project admin can add backends and
+manage SSH fleets, which is what `default_permissions` in `config.yml` exists to
+prevent. Creating a user does **not** grant project access — the two calls are
+separate, and only the second one lets them run.
 
 **e. Check it took.** The server logs `Loaded plugin ctpolicy` at startup — if it
 does not, nothing is being enforced.

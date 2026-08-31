@@ -7,14 +7,19 @@ cloud permission flag, two-level priority, per-user overrides, time and dollar
 budgets, the usage snapshot, the enforcer backstop and the `dstack-quota`
 command are all implemented; see [Build order](#build-order).
 
+Deployed and exercised in the dev environment; see
+[What has actually been verified](#what-has-actually-been-verified) for exactly
+which behaviours were observed and which have not been.
+
 Two deliberate deployment states to know about:
 
 * The enforcer ships with `DSTACK_CT_ENFORCER_DRY_RUN=true`. It writes usage
   snapshots from the first cycle — which is what makes budgets enforceable at
   admission — but logs `WOULD STOP` instead of stopping anything. Set it to
   `false` to arm the backstop.
-* `policy.yaml` ships with placeholder usernames. It is fail-closed, so real
-  users are rejected until they are listed.
+* `policy.yaml` is fail-closed on users. Somebody who is a member of a team
+  project but absent from that team's `users` is rejected at submission, so
+  onboarding is two steps: add the membership *and* list them in the file.
 
 This document is the decision record. [`CARBONTEQ_FORK.md`](CARBONTEQ_FORK.md)
 remains the rebase ledger for changes inside upstream files;
@@ -403,6 +408,55 @@ the fleet plan path and in `_update_fleet`'s added-hosts branch, not in
 `_create_fleet`, so a direct create-API call can double-register a host. And
 removing an import terminates running jobs on those instances with
 `INSTANCE_ACCESS_REVOKED` — an emergency lever, never a routine one.
+
+## What has actually been verified
+
+Recorded on 2026-08-31 against the dev deployment
+(`https://dstack.carbontech.build`, one SSH worker, one instance, no blocks),
+with `talha` in team-research, `abdullah` in team-platform and `aayan` in
+team-infra. Distinguishing what was exercised from what merely exists is the
+point of this section: the rest of the document describes intent.
+
+### Confirmed against the running deployment
+
+| Area | Evidence |
+| --- | --- |
+| Fleet sharing | `dstack export list` shows `shared-hw` with `IMPORTERS *`; all three team projects list `main/mvp-workers` with an idle instance |
+| Fail-closed on users | `dstack apply` as `admin` in a team project is rejected by name, listing who *is* configured |
+| Per-user clamping | talha 99 / `[nebius, remote]` / `$4.00` / window remainder; abdullah 69 / `[remote]` / 8h cap; aayan 39 / `[remote]` / 4h cap |
+| Cloud gating | `backends: [aws]` rejected for all three, with team-research distinguishing "may not use backends: aws" from team-platform's "may not provision external cloud resources"; `[nebius]` admitted for team-research and pinned |
+| Isolation | A run submitted by talha is invisible to `dstack ps` for the other two, and `dstack stop` on it fails with "not found" |
+| Priority bands | `priority: 100` in the file stores as 99 / 69 / 39 |
+| Enforcer liveness | Inferred, and soundly: team-research is the only budgeted team, `on_usage_unavailable: deny` and `usage_snapshot_max_age: 180s`, so its admissions two minutes apart both required a snapshot under 180s old |
+
+### Not yet exercised
+
+These are the honest gaps. None is known-broken; none has been observed working
+end to end either.
+
+- **Priority *ordering*.** Bands are stored correctly, but with one instance and
+  `retry: false` the losing runs failed rather than queued, so nothing was ever
+  ordered. Exercising it needs contention: give the fleet `blocks` so two jobs
+  fit, or enable `retry`, then submit from a low band and a high band together.
+  Even then this only demonstrates ordering — dstack's queue is best-effort by
+  design (see [Risks](#risks-and-known-gaps)).
+- **Window rejection.** Every test ran inside `Mon-Fri 08:00-20:00 Asia/Karachi`.
+  Narrowing a team's window in `policy.yaml` tests it without waiting; the file
+  hot-reloads, so no redeploy is needed.
+- **Budget exhaustion**, and the on-prem fallback when a dollar budget runs out.
+  Both were covered by unit tests and by a synthetic snapshot in a local stack,
+  but not with real accumulated usage.
+- **Enforcer termination.** Still `DSTACK_CT_ENFORCER_DRY_RUN=true`, so no run
+  has been stopped by policy in the deployment.
+- **`dstack-quota` in the deployment.** Verified in a local stack; not run on the
+  Dokploy host, which is password-only over SSH.
+
+### Outstanding decisions
+
+- The `400h/month` and `$1500/month` budgets on team-research are illustrative
+  values carried over from the example config, not figures anyone chose.
+- The `Mon-Fri 08:00-20:00` window is likewise a placeholder. Outside it,
+  submissions are rejected outright — including evenings and weekends.
 
 ## Verification
 
