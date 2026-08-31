@@ -1,3 +1,4 @@
+from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union, overload
 
@@ -429,6 +430,20 @@ class ProfileParams(CoreModel):
     schedule: Annotated[
         Optional[Schedule],
         Field(description=("The schedule for starting the run at specified time")),
+    ] = None
+    # CARBONTEQ: a one-shot absolute start time, for holding a run until a
+    # compute window opens. `schedule` cannot express this — cron means
+    # recurring, and the terminating pipeline reschedules a cron run when its
+    # execution ends, which would turn a single held run into a daily one.
+    start_after: Annotated[
+        Optional[datetime],
+        Field(
+            description=(
+                "An absolute UTC time at which to start the run, once. Unlike `schedule`"
+                " the run is not repeated: it stays `pending` until this time and is never"
+                " rescheduled after it finishes. Ignored when `schedule` is also set."
+            )
+        ),
     ] = None
     fleets: Annotated[
         Optional[

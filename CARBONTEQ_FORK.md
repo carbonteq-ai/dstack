@@ -219,6 +219,46 @@ with the delta reverted.
 The design this supports is recorded in `CARBONTEQ_POLICY.md`; the policy plugin
 itself lives in `policy/` and is additive, so it carries no rebase surface.
 
+### One-shot deferred start
+
+The compute-window hold (ADR-022). A run admitted at 03:00 for a team whose
+window opens at 08:00 must sit inert and enter the queue at 08:00, with the
+control plane holding nothing of its own.
+
+dstack already has the holding and the releasing: `RunStatus.PENDING`,
+`RunModel.next_triggered_at`, and a release predicate that picks up any run
+whose `next_triggered_at` has passed. What it lacks is a way to say *hold until
+this instant*. Its only trigger source is a cron expression, and cron means
+recurring — the terminating pipeline recomputes the next fire time when an
+execution ends, so a window hold expressed as a cron would quietly become a
+daily job. That was checked against the source, not assumed.
+
+The delta:
+
+- adds `start_after`, an absolute UTC instant, to `ProfileParams` in
+  `src/dstack/_internal/core/models/profiles.py`, directly after `schedule`;
+- gives `_get_next_triggered_at()` in
+  `src/dstack/_internal/server/services/runs/__init__.py` an `after_execution`
+  keyword, returning the one-shot instant on the submission path and **None**
+  on the post-execution path;
+- holds the run at submission by extending the same file's `PENDING` condition
+  to cover `start_after`; and
+- passes `after_execution=True` from
+  `src/dstack/_internal/server/background/pipeline_tasks/runs/terminating.py`.
+
+A cron and a `start_after` on the same spec is not an error: the schedule wins,
+and the precedence is asserted rather than left to be discovered.
+
+No migration. `next_triggered_at` already exists and already holds an absolute
+instant; this only widens what may compute one.
+
+Regression coverage is `TestOneShotDeferredStart` in
+`src/tests/_internal/server/services/runs/test_runs.py` — five cases, of which
+the load-bearing one is that a one-shot returns no next trigger after it runs
+while a cron still does — and
+`test_creates_pending_run_if_run_has_a_one_shot_start` in
+`src/tests/_internal/server/routers/test_runs.py`.
+
 ## Compatibility and release
 
 Build the server, runner, and shim from the same fork commit and give the
@@ -250,6 +290,19 @@ Ruff check and format check passed
 git diff --check passed
 ```
 
+Re-run for the deferred start (2026-08-31), after `policy/` was deleted:
+
+```text
+3,099 Python tests passed, 1,213 skipped   (src/tests, proxy suite excluded:
+                                            it needs `openai`, unrelated)
+ruff 0.12.7 check and format clean         (the version pyproject pins; a
+                                            newer ruff reformats unrelated files)
+git diff --check passed
+```
+
+The Go packages were not re-run: this delta is Python-only and does not touch
+the runner payload.
+
 Before publication, repeat the Python suite with PostgreSQL enabled, build the
 server and both binaries from the immutable candidate commit, and run a live
 Docker cancellation whose handler takes more than ten seconds but less than
@@ -272,11 +325,29 @@ The submit-route delta is a separate unit. Inspect the runs router alongside
 route or moves the policy call into `submit_run()` — and in the latter case
 remove the route-level call, or policies will be applied twice.
 
+The deferred start is a third unit, and the cheapest of the three to get
+subtly wrong. Inspect `_get_next_triggered_at()` together with **both** its call
+sites — submission in `services/runs/__init__.py` and post-execution in
+`background/pipeline_tasks/runs/terminating.py` — as one conflict-sensitive
+group.
+
+The failure to guard against is losing `after_execution=True` at the terminating
+call site. Nothing breaks loudly: every held run simply becomes recurring, firing
+once per window forever, and the first symptom is a duplicated workload rather
+than an error. A rebase that takes upstream's version of that line reintroduces
+it silently, which is why `TestOneShotDeferredStart` asserts the negative case.
+
+Adding a field to `ProfileParams` also carries a test tax that is easy to
+misread as breakage: several suites compare a whole serialized profile against a
+literal dict. After any change there, `grep -rn '"schedule": None' src/tests` and
+add the new key beside it — currently four sites in
+`routers/test_runs.py` and three in `routers/test_fleets.py`.
+
+Retire the deferred start if upstream gains a one-shot start time of its own, or
+if compute windows stop being a requirement.
+
 Because the plugin hook is upstream-experimental, also re-check
-`ApplyPolicy.on_run_apply`'s signature on every rebase. `policy/` imports from
-`dstack._internal` only through `policy/src/ctpolicy/_compat.py`, so a moved
-symbol surfaces there; run `uv run pytest policy/tests` as part of the rebase
-gate.
+`ApplyPolicy.on_run_apply`'s signature on every rebase.
 
 Published fork commit: branch `codex/graceful-cancellation-stop-duration`
 (record the exact head SHA in the consumer repository after publication).

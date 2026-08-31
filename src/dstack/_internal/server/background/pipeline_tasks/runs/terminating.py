@@ -136,7 +136,7 @@ def _get_run_update_map(run_model: models.RunModel) -> TerminatingRunUpdateMap:
     }:
         return TerminatingRunUpdateMap(
             status=RunStatus.PENDING,
-            next_triggered_at=_get_next_triggered_at(run_spec),
+            next_triggered_at=_get_next_triggered_at(run_spec, after_execution=True),
             fleet_id=None,
             resubmission_attempt=0,
         )

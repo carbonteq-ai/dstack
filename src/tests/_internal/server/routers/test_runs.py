@@ -218,6 +218,7 @@ def get_dev_env_run_plan_dict(
             "startup_order": None,
             "stop_criteria": None,
             "schedule": None,
+            "start_after": None,
             "reservation": None,
             "fleets": None,
             "tags": None,
@@ -245,6 +246,7 @@ def get_dev_env_run_plan_dict(
             "startup_order": None,
             "stop_criteria": None,
             "schedule": None,
+            "start_after": None,
             "reservation": None,
             "fleets": None,
             "tags": None,
@@ -470,6 +472,7 @@ def get_dev_env_run_dict(
                 "startup_order": None,
                 "stop_criteria": None,
                 "schedule": None,
+                "start_after": None,
                 "reservation": None,
                 "fleets": None,
                 "tags": None,
@@ -497,6 +500,7 @@ def get_dev_env_run_dict(
                 "startup_order": None,
                 "stop_criteria": None,
                 "schedule": None,
+                "start_after": None,
                 "reservation": None,
                 "fleets": None,
                 "tags": None,
@@ -3251,6 +3255,41 @@ class TestApplyPlan:
         assert run is not None
         assert run.status == RunStatus.PENDING
         assert run.next_triggered_at == datetime(2023, 1, 2, 3, 10, tzinfo=timezone.utc)
+
+    # CARBONTEQ: the one-shot deferred start — a run held until its team's
+    # compute window opens. Same holding mechanism as a schedule, but it fires
+    # once; see TestOneShotDeferredStart for the non-recurrence.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_creates_pending_run_if_run_has_a_one_shot_start(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(run_name="test-run", repo_id=repo.name)
+        run_spec.configuration.start_after = datetime(2023, 1, 2, 8, 0, tzinfo=timezone.utc)
+        with freeze_time(datetime(2023, 1, 2, 3, 9, tzinfo=timezone.utc)):
+            response = await client.post(
+                f"/api/project/{project.name}/runs/apply",
+                headers=get_auth_headers(user.token),
+                json={
+                    "plan": {
+                        "run_spec": json.loads(run_spec.json()),
+                        "current_resource": None,
+                    },
+                    "force": False,
+                },
+            )
+        assert response.status_code == 200, response.json()
+        res = await session.execute(select(RunModel))
+        run = res.scalar()
+        assert run is not None
+        assert run.status == RunStatus.PENDING
+        assert run.next_triggered_at == datetime(2023, 1, 2, 8, 0, tzinfo=timezone.utc)
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("test_db")

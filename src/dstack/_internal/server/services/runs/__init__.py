@@ -726,7 +726,11 @@ async def submit_run(
         submitted_at = common_utils.get_current_datetime()
         initial_status = RunStatus.SUBMITTED
         initial_replicas = 1
-        if run_spec.merged_profile.schedule is not None:
+        # CARBONTEQ: `start_after` holds a run exactly as a schedule does.
+        if (
+            run_spec.merged_profile.schedule is not None
+            or run_spec.merged_profile.start_after is not None
+        ):
             initial_status = RunStatus.PENDING
             initial_replicas = 0
 
@@ -1231,9 +1235,17 @@ def is_job_ready(probes: Iterable[ProbeModel], probe_specs: Iterable[ProbeSpec])
     return all(is_probe_ready(probe, probe_spec) for probe, probe_spec in zip(probes, probe_specs))
 
 
-def _get_next_triggered_at(run_spec: RunSpec) -> Optional[datetime]:
+def _get_next_triggered_at(
+    run_spec: RunSpec, *, after_execution: bool = False
+) -> Optional[datetime]:
     if run_spec.merged_profile.schedule is None:
-        return None
+        # CARBONTEQ: the one-shot deferred start. `after_execution` is the
+        # terminating pipeline asking for the *next* trigger — for a one-shot
+        # there is not one, and answering with the same instant again is exactly
+        # how a single held run becomes a recurring one.
+        if after_execution:
+            return None
+        return run_spec.merged_profile.start_after
     now = common_utils.get_current_datetime()
     fire_times = []
     for cron in run_spec.merged_profile.schedule.crons:

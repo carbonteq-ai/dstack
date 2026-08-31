@@ -1,10 +1,13 @@
+from datetime import datetime, timezone
+
 import pytest
+from freezegun import freeze_time
 from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dstack._internal.core.errors import ServerClientError
 from dstack._internal.core.models.backends.base import BackendType
-from dstack._internal.core.models.profiles import Profile, ProfileRetry, RetryEvent
+from dstack._internal.core.models.profiles import Profile, ProfileRetry, RetryEvent, Schedule
 from dstack._internal.core.models.runs import JobStatus, JobTerminationReason, RunStatus
 from dstack._internal.core.models.users import GlobalRole, ProjectRole
 from dstack._internal.server.models import UserModel
@@ -362,3 +365,58 @@ class TestCanAttachRunVolumes:
         volumes = [[vol1], [vol1]]
         with pytest.raises(ServerClientError):
             check_can_attach_job_volumes(volumes)
+
+
+class TestOneShotDeferredStart:
+    """CARBONTEQ: `start_after` holds a run until an absolute instant, once.
+
+    The delta exists because `schedule` cannot express it. Cron means recurring:
+    the terminating pipeline recomputes the next trigger when an execution ends,
+    so a window hold written as a cron would quietly become a daily job. These
+    tests pin the difference — the reason for the fork is that one of them fails
+    upstream.
+    """
+
+    def _spec(self, **profile_kwargs):
+        run_spec = get_run_spec(run_name="test-run", repo_id="test-repo")
+        for key, value in profile_kwargs.items():
+            setattr(run_spec.configuration, key, value)
+        # `merged_profile` is built by a root validator at construction, so a
+        # field assigned afterwards is invisible to it. Re-parse, which is what
+        # the server does with the submitted JSON anyway — and without this the
+        # assertions below pass against an empty profile and prove nothing.
+        return type(run_spec).parse_raw(run_spec.json())
+
+    def test_a_one_shot_start_is_the_trigger(self):
+        when = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
+        assert runs_services._get_next_triggered_at(self._spec(start_after=when)) == when
+
+    def test_a_one_shot_start_is_not_rescheduled_after_it_runs(self):
+        """The whole point. Upstream has no `after_execution` notion because
+        every trigger it knows about recurs."""
+        when = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
+        spec = self._spec(start_after=when)
+        assert runs_services._get_next_triggered_at(spec, after_execution=True) is None
+
+    def test_a_cron_schedule_still_recurs_after_it_runs(self):
+        """The delta must not turn scheduled runs into one-shots."""
+        spec = self._spec(schedule=Schedule(cron=["5 * * * *"]))
+        with freeze_time(datetime(2026, 9, 1, 3, 0, tzinfo=timezone.utc)):
+            assert runs_services._get_next_triggered_at(spec, after_execution=True) == datetime(
+                2026, 9, 1, 3, 5, tzinfo=timezone.utc
+            )
+
+    def test_a_schedule_wins_when_both_are_set(self):
+        """Documented precedence, asserted so it cannot drift silently."""
+        spec = self._spec(
+            schedule=Schedule(cron=["5 * * * *"]),
+            start_after=datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc),
+        )
+        with freeze_time(datetime(2026, 9, 1, 3, 0, tzinfo=timezone.utc)):
+            assert runs_services._get_next_triggered_at(spec) == datetime(
+                2026, 9, 1, 3, 5, tzinfo=timezone.utc
+            )
+
+    def test_a_run_with_neither_has_no_trigger(self):
+        assert runs_services._get_next_triggered_at(self._spec()) is None
+        assert runs_services._get_next_triggered_at(self._spec(), after_execution=True) is None
