@@ -6,7 +6,7 @@ Published candidate branch. The working tree is based on upstream dstack
 `0.20.29` at commit `2f9618f4d521140350efd1b344412d122c1e0322`.
 `origin` points to `carbonteq-ai/dstack` and `upstream` points to
 `dstackai/dstack`. Consumers may pin only a published CarbonTeq commit by full
-SHA. Commit `a73c3314ab54cbe0e6056f6dad2e33e173596be6` is the currently qualified
+SHA. Commit `ae5dac6576b0f19b49e81b31781f3b9f14e95361` is the currently qualified
 server/runner/shim release.
 
 Published branch `codex/registry-default-auth` adds the exact-host registry
@@ -16,6 +16,8 @@ failover implementation is commit `e9d74b0cfd330500879946141469313e46de2e7d`.
 The bounded retry-budget, region-cooldown, and persisted managed-storage
 rotation implementation is published and deployed at commit
 `a73c3314ab54cbe0e6056f6dad2e33e173596be6`.
+The provider-configurable minimum stock policy is published and deployed at
+commit `ae5dac6576b0f19b49e81b31781f3b9f14e95361`.
 
 ## Maintained delta
 
