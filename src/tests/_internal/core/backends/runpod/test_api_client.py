@@ -69,3 +69,35 @@ def test_create_cpu_pod_uses_deploy_cpu_pod(monkeypatch):
     assert response["id"] == "cpu-pod-1"
     assert "deployCpuPod" in query["value"]
     assert "podFindAndDeployOnDemand" not in query["value"]
+
+
+def test_get_data_center_gpu_availability(monkeypatch):
+    client = RunpodApiClient(api_key="test")
+    query = {}
+
+    def fake_make_request(data):
+        query["value"] = data["query"]
+        return _Response(
+            {
+                "data": {
+                    "dataCenters": [
+                        {
+                            "id": "US-MD-1",
+                            "gpuAvailability": [
+                                {"gpuTypeId": "NVIDIA A100 80GB PCIe", "stockStatus": "Medium"}
+                            ],
+                        },
+                        {"id": "EUR-IS-1", "gpuAvailability": []},
+                    ]
+                }
+            }
+        )
+
+    monkeypatch.setattr(client, "_make_request", fake_make_request)
+
+    assert client.get_data_center_gpu_availability() == {
+        "US-MD-1": {"NVIDIA A100 80GB PCIe": "Medium"},
+        "EUR-IS-1": {},
+    }
+    assert "gpuAvailability" in query["value"]
+    assert "gpuTypeId" in query["value"]

@@ -68,6 +68,7 @@ CONFIGURABLE_DISK_SIZE = Range[Memory](min=Memory.parse("1GB"), max=None)
 
 class RunpodOfferBackendData(CoreModel):
     pod_counts: Optional[list[int]] = None
+    stock_status: Optional[str] = None
 
 
 class RunpodCompute(
@@ -92,6 +93,7 @@ class RunpodCompute(
                 requirements=requirements,
                 regions=self.config.regions,
                 allow_community_cloud=self.config.allow_community_cloud,
+                gpu_availability=self.api_client.get_data_center_gpu_availability(),
             )
         else:
             offers = get_catalog_offers(
@@ -572,6 +574,7 @@ def _get_live_gpu_offers(
     requirements: Requirements,
     regions: Optional[List[str]],
     allow_community_cloud: bool,
+    gpu_availability: dict[str, dict[str, str]],
 ) -> List[InstanceOffer]:
     gpu = get_or_error(requirements.resources.gpu)
     min_gpu_count = gpu.count.min or 1
@@ -594,5 +597,9 @@ def _get_live_gpu_offers(
             configurable_disk_size=CONFIGURABLE_DISK_SIZE,
         )
         if offer is not None:
+            stock_status = gpu_availability.get(offer.region, {}).get(offer.instance.name, "")
+            if stock_status.lower() not in {"low", "medium", "high"}:
+                continue
+            offer.backend_data = RunpodOfferBackendData(stock_status=stock_status).dict()
             offers.append(offer)
     return offers

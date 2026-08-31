@@ -6,6 +6,7 @@ from gpuhunt.providers.runpod import RunpodProvider
 
 from dstack._internal.core.backends.runpod.compute import (
     RunpodCompute,
+    RunpodOfferBackendData,
     _RunpodLiveGPUProvider,
 )
 from dstack._internal.core.backends.runpod.models import RunpodAPIKeyCreds, RunpodConfig
@@ -80,6 +81,11 @@ def test_spot_gpu_offers_come_from_live_runpod_capacity():
     with (
         patch.object(RunpodProvider, "__init__", return_value=None),
         patch.object(_RunpodLiveGPUProvider, "get", return_value=[raw_offer]),
+        patch.object(
+            compute.api_client,
+            "get_data_center_gpu_availability",
+            return_value={"EU-CZ-1": {"NVIDIA RTX PRO 6000 Blackwell Server Edition": "Medium"}},
+        ),
     ):
         offers = compute.get_offers_by_requirements(requirements)
 
@@ -90,6 +96,41 @@ def test_spot_gpu_offers_come_from_live_runpod_capacity():
     assert offers[0].instance.resources.spot is True
     assert offers[0].instance.resources.gpus[0].name == "RTXPRO6000"
     assert offers[0].instance.resources.gpus[0].memory_mib == 96 * 1024
+    assert RunpodOfferBackendData.parse_obj(offers[0].backend_data).stock_status == "Medium"
+
+
+def test_spot_gpu_offers_reject_regions_without_reported_stock():
+    raw_offer = gpuhunt.RawCatalogItem(
+        instance_name="NVIDIA A100 80GB PCIe",
+        location="EUR-IS-1",
+        price=1.89,
+        cpu=16,
+        memory=125,
+        gpu_vendor="nvidia",
+        gpu_count=1,
+        gpu_name="A100",
+        gpu_memory=80,
+        spot=True,
+        disk_size=None,
+    )
+    compute = RunpodCompute(
+        RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret"), community_cloud=False)
+    )
+    requirements = Requirements(
+        resources=ResourcesSpec(gpu="A100:1", disk="20GB"),
+        spot=True,
+    )
+
+    with (
+        patch.object(RunpodProvider, "__init__", return_value=None),
+        patch.object(_RunpodLiveGPUProvider, "get", return_value=[raw_offer]),
+        patch.object(
+            compute.api_client,
+            "get_data_center_gpu_availability",
+            return_value={"EUR-IS-1": {"NVIDIA A100 80GB PCIe": ""}},
+        ),
+    ):
+        assert compute.get_offers_by_requirements(requirements) == []
 
 
 def test_on_demand_offers_keep_using_offline_catalog():

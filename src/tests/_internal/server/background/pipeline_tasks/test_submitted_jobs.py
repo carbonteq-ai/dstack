@@ -50,6 +50,7 @@ from dstack._internal.server.background.pipeline_tasks.jobs_submitted import (
     JobSubmittedPipelineItem,
     JobSubmittedWorker,
     _can_rotate_run_storage,
+    _get_runpod_offer_stock_rank,
     _load_submitted_job_context,
     _select_run_storage_region,
 )
@@ -443,6 +444,22 @@ class TestJobSubmittedWorker:
 
         assert region == "US-KS-2"
 
+        offers[0][1].backend_data = {"stock_status": "Low"}
+        offers[1][1].backend_data = {"stock_status": "Medium"}
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+            new=AsyncMock(return_value=offers),
+        ):
+            stocked_region = await _select_run_storage_region(
+                context,
+                RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+        assert stocked_region == "US-CA-2"
+        assert _get_runpod_offer_stock_rank(offers[0][1]) == 1
+        assert _get_runpod_offer_stock_rank(offers[1][1]) == 2
+        offers[0][1].backend_data = {}
+        offers[1][1].backend_data = {}
+
         now = get_current_datetime()
         volume = await create_volume(
             session=session,
@@ -618,9 +635,7 @@ class TestJobSubmittedWorker:
         )
         volume.run_id = run.id
         run_spec = get_persisted_run_spec(run)
-        run_spec.configuration.volumes = [
-            VolumeMountPoint(name=volume.name, path="/workspace")
-        ]
+        run_spec.configuration.volumes = [VolumeMountPoint(name=volume.name, path="/workspace")]
         run.run_spec = run_spec.json()
         await session.commit()
 

@@ -1084,11 +1084,37 @@ async def _select_run_storage_region(
     selected = min(
         candidates,
         key=lambda offer: (
+            -_get_runpod_offer_stock_rank(offer),
             offer.price,
             configured_regions[offer.region.lower()][0],
         ),
     )
+    logger.info(
+        "Selected RunPod managed storage region %s from live offers (stock_status=%s, price=%s)",
+        selected.region,
+        _get_runpod_offer_stock_status(selected) or "unknown",
+        selected.price,
+    )
     return configured_regions[selected.region.lower()][1]
+
+
+def _get_runpod_offer_stock_rank(offer: InstanceOfferWithAvailability) -> int:
+    return {"low": 1, "medium": 2, "high": 3}.get(
+        _get_runpod_offer_stock_status(offer).lower(),
+        0,
+    )
+
+
+def _get_runpod_offer_stock_status(offer: InstanceOfferWithAvailability) -> str:
+    backend_data = offer.backend_data
+    if isinstance(backend_data, str):
+        try:
+            backend_data = json.loads(backend_data)
+        except ValueError:
+            return ""
+    if not isinstance(backend_data, dict):
+        return ""
+    return str(backend_data.get("stock_status", ""))
 
 
 def _get_run_storage_failed_regions(volume_model: Optional[VolumeModel]) -> dict[str, float]:

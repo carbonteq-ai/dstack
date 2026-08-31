@@ -48,6 +48,30 @@ class RunpodApiClient:
         )
         return resp.json()
 
+    def get_data_center_gpu_availability(self) -> Dict[str, Dict[str, str]]:
+        resp = self._make_request(
+            {
+                "query": """
+                query dataCenters {
+                    dataCenters {
+                        id
+                        gpuAvailability {
+                            gpuTypeId
+                            stockStatus
+                        }
+                    }
+                }
+                """
+            }
+        )
+        availability: Dict[str, Dict[str, str]] = {}
+        for data_center in resp.json()["data"]["dataCenters"]:
+            availability[data_center["id"]] = {
+                gpu["gpuTypeId"]: gpu.get("stockStatus", "")
+                for gpu in data_center.get("gpuAvailability", [])
+            }
+        return availability
+
     def create_pod(
         self,
         name: str,
