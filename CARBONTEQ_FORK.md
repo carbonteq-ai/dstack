@@ -6,8 +6,9 @@ Published candidate branch. The working tree is based on upstream dstack
 `0.20.29` at commit `2f9618f4d521140350efd1b344412d122c1e0322`.
 `origin` points to `carbonteq-ai/dstack` and `upstream` points to
 `dstackai/dstack`. Consumers may pin only a published CarbonTeq commit by full
-SHA. Commit `ae5dac6576b0f19b49e81b31781f3b9f14e95361` is the currently qualified
-server/runner/shim release.
+SHA. Commit `ff60da0395f2b5832f99e50a8d1f4f6ebf3367c4` is the currently qualified
+server/runner/shim release; its merge migration, rolling worker gate, and
+graceful-cancellation canary passed in production.
 
 Published branch `codex/registry-default-auth` adds the exact-host registry
 credential and live RunPod GPU-offer behavior below on top of commit
