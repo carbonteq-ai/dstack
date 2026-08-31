@@ -8,12 +8,17 @@
 #
 #   DSTACK_POSTGRES_PASSWORD    generated
 #   DSTACK_SERVER_ADMIN_TOKEN   generated
-#   DSTACK_RELEASE_VERSION      output of ./version.sh  (bump on every rebuild)
 #   DSTACK_BINARIES_URL         http://<dokploy-vm-lan-ip>:8080   (no trailing /)
 #   DSTACK_SERVER_URL           http://<dokploy-vm-lan-ip>:3001
 #
-# Optional, if the defaults clash with something else on the host:
+# Set once, never touched again. The release version is NOT among them: both
+# images derive it from the git metadata in the build context, so every deploy
+# is automatically versioned by the commit it was built from.
 #
+# Optional:
+#
+#   DSTACK_RELEASE_VERSION      pin the version instead of deriving it. Only for
+#                               reproducing a specific build; normally unset.
 #   DSTACK_SERVER_HOST_PORT     default 3001  (3000 is Dokploy's own UI)
 #   DSTACK_BINARIES_HOST_PORT   default 8080
 
@@ -40,7 +45,9 @@ services:
       context: ../../..
       dockerfile: docker/server/carbonteq/Dockerfile
       args:
-        RELEASE_VERSION: ${DSTACK_RELEASE_VERSION:?run ./version.sh}
+        # Empty means "derive from the commit in the build context". Set
+        # DSTACK_RELEASE_VERSION only to reproduce a specific historical build.
+        RELEASE_VERSION: ${DSTACK_RELEASE_VERSION:-}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -52,11 +59,14 @@ services:
       DSTACK_SERVER_LOG_FORMAT: json
       DSTACK_SERVER_LOG_LEVEL: ${DSTACK_SERVER_LOG_LEVEL:-INFO}
 
-      # One version drives the server, runner and shim. DSTACK_VERSION is baked
-      # into the image by the Dockerfile; these two tell the server which
-      # component build every worker must be running.
-      DSTACK_RUNNER_VERSION: ${DSTACK_RELEASE_VERSION}
-      DSTACK_SHIM_VERSION: ${DSTACK_RELEASE_VERSION}
+      # One version drives the server, runner and shim, and it is baked into the
+      # image rather than passed here. `{version}` below is substituted by the
+      # server with that same value, and the binaries image serves exactly that
+      # path — both derived from the same commit at build time.
+      #
+      # DSTACK_RUNNER_VERSION and DSTACK_SHIM_VERSION are intentionally absent:
+      # `get_dstack_runner_version()` and `get_dstack_shim_version()` check
+      # DSTACK_VERSION first, so those two were already dead settings.
       DSTACK_RUNNER_DOWNLOAD_URL: ${DSTACK_BINARIES_URL:?set the binaries URL}/{version}/binaries/dstack-runner-linux-{arch}
       DSTACK_SHIM_DOWNLOAD_URL: ${DSTACK_BINARIES_URL}/{version}/binaries/dstack-shim-linux-{arch}
 
@@ -98,7 +108,10 @@ services:
       context: ../../..
       dockerfile: docker/server/carbonteq/Dockerfile.binaries
       args:
-        VERSION: ${DSTACK_RELEASE_VERSION}
+        # Same contract as the server: empty derives from the commit. Both
+        # images run the same version.sh over the same context, so the path
+        # served here always matches the version the server asks for.
+        VERSION: ${DSTACK_RELEASE_VERSION:-}
     restart: unless-stopped
     ports:
       # Verified free on a stock Dokploy host; override if yours differs.

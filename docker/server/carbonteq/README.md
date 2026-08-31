@@ -58,7 +58,13 @@ If the ping fails it is the Unraid VM network mode, not Docker — put both VMs 
 `br0`. If the ping passes and the container check fails, the likely cause is a
 LAN in the `172.16–172.31.x.x` range colliding with Docker's bridge subnet.
 
-## 3. Compute the version
+## 3. The version takes care of itself
+
+There is nothing to do here. Both images derive their version from the commit
+they are built from, so every deploy is versioned automatically and there is no
+environment variable to bump.
+
+To see what a build will call itself:
 
 ```
 ./docker/server/carbonteq/version.sh
@@ -68,9 +74,34 @@ This is the `ai-infra` release contract: `<upstream tag>+carbonteq.g<12 commit
 chars>`. It is valid PEP 440, and the `g` prefix stops an all-numeric commit
 prefix being normalized as a numeric local-version component.
 
-**Bump it on every rebuild.** The server installs a component onto a worker only
-when the expected version differs from what that worker reports, so a stale
-version means workers silently keep their old binaries.
+Why it matters that it changes: the server installs a component onto a worker
+only when the expected version differs from what that worker reports, so a
+version that did not move meant workers silently kept their old binaries. That
+was the failure mode of bumping it by hand.
+
+<details>
+<summary>How the derivation works</summary>
+
+`.dockerignore` keeps `.git/HEAD`, `.git/refs` and `.git/packed-refs` in the
+build context — a few kilobytes — and drops the rest of `.git` along with
+`.venv` and caches. Each image runs `version.sh` in a small first stage, which
+resolves HEAD by reading those files directly, so no git binary is needed in
+either base image.
+
+The server image then writes the result into `src/dstack/version.py` before
+building the wheel. That is enough on its own: `_internal/settings.py` reads
+`DSTACK_VERSION` with `dstack.version.__version__` as its fallback, and
+`get_dstack_runner_version()` / `get_dstack_shim_version()` check
+`DSTACK_VERSION` before `DSTACK_RUNNER_VERSION` / `DSTACK_SHIM_VERSION` — which
+is why those two compose variables are gone; they were already dead settings.
+
+The binaries image runs the same script over the same context, so the path it
+serves is always the path the server asks for. The build fails if the baked
+version does not match the derived one.
+
+To reproduce a specific historical build, set `DSTACK_RELEASE_VERSION` and both
+images use it verbatim instead of deriving.
+</details>
 
 ## 4. Deploy on Dokploy
 
@@ -80,10 +111,25 @@ Compose application → this repo, branch `dstack-cp-mvp`, compose path
 ```
 DSTACK_POSTGRES_PASSWORD=<generated>
 DSTACK_SERVER_ADMIN_TOKEN=<generated>
-DSTACK_RELEASE_VERSION=<output of version.sh>
 DSTACK_SERVER_URL=http://<dokploy-vm-lan-ip>:3001
 DSTACK_BINARIES_URL=http://<dokploy-vm-lan-ip>:8080
 ```
+
+Set once and never touched again — redeploying a new commit needs no environment
+change. If you are upgrading an existing Dokploy app, delete the old
+`DSTACK_RELEASE_VERSION` variable; leaving it pins every future build to that
+one version, which is exactly the stale-worker failure described above.
+
+After a deploy, confirm the two images agree:
+
+```
+docker compose exec server cat /etc/carbonteq-release
+docker compose exec binaries ls /usr/share/nginx/html
+```
+
+Those two strings must be identical. They are derived from the same commit by
+the same script, so a mismatch means one of the services was built from a
+different checkout.
 
 Port 8080 must be reachable from the worker VM. Verify from the worker:
 
@@ -162,8 +208,8 @@ retry: false
 `dstack apply`, wait for `cancellation-ready`, then cancel. The handler sleeps
 20 seconds — well past upstream's fixed ten-second kill. Seeing
 `graceful-stop-complete` is the fork working. Being killed at ten seconds means
-the worker is still on upstream binaries; check the binaries URL and that you
-bumped the version.
+the worker is still on upstream binaries: check that the binaries URL is
+reachable from the worker, and that the two version strings from step 4 match.
 
 ## 7. Set up teams and policy
 

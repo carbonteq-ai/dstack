@@ -144,6 +144,12 @@ runner/shim one matching component version. A mixed rollout is unsafe:
 - a new component version is required for dstack worker reconciliation to
   install the binaries.
 
+The MVP deployment enforces this by construction rather than by convention: both
+images derive their version from the commit in the build context, and the
+version the server reports is the one baked into its wheel, so the component set
+cannot silently disagree and no operator has to remember to bump anything. See
+`docker/server/carbonteq/README.md`.
+
 The supported production path is dstack tasks on Linux AMD64 SSH-fleet workers
 using Docker. The runner sends the interrupt to the launched process, so the
 job shell must `exec` the stable worker command or forward signals.

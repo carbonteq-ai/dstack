@@ -1,0 +1,20 @@
+# Keep the build context small. Without this every build ships the whole working
+# tree to the daemon — over a gigabyte once a local .venv exists, against ~50 MB
+# of actual source.
+#
+# The exception is the git ref metadata: docker/server/carbonteq/version.sh
+# resolves HEAD from it to derive the release version, so a build needs no
+# manually supplied version. Only the refs are kept, not .git/objects, which is
+# the bulk of it — see version.sh for how it reads them without a git binary.
+
+.git
+!.git/HEAD
+!.git/refs
+!.git/packed-refs
+
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+**/node_modules
