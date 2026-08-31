@@ -22,6 +22,9 @@ The candidate branch incorporates CarbonTeq default-branch commit
 `b5ff8987f` through merge commit
 `98c75b7f6136fb40420e58a6f3eed476f6aaa088`; this retains the maintained delta
 while including the current gateway-replica and full-offer work.
+The post-merge release successor joins the upstream gateway and CarbonTeq
+run-lifecycle Alembic branches with one no-op merge revision. This keeps both
+published migration histories intact while restoring a single `head` target.
 
 ## Maintained delta
 
