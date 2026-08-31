@@ -13,8 +13,9 @@ parse error rather than silently falling back to a stale or permissive policy.
 import os
 import re
 import threading
+from enum import Enum
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -86,10 +87,6 @@ class Window(_Model):
             )
         return v
 
-    @property
-    def wraps_midnight(self) -> bool:
-        return self.end_seconds < self.start_seconds
-
     def pretty(self) -> str:
         """Render the window the way the rejection message shows it."""
         names = "/".join(DAY_NAMES[d] for d in sorted(self.weekdays))
@@ -102,6 +99,32 @@ def _fmt_seconds(seconds: int) -> str:
     return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}"
 
 
+class Period(str, Enum):
+    """The window a budget resets on, evaluated in the config timezone."""
+
+    MONTH = "month"
+    WEEK = "week"
+
+
+class TimeBudget(_Model):
+    period: Period
+    limit: Duration
+    """Seconds of run time per period, written as e.g. `400h`."""
+
+    @validator("limit")
+    def _positive(cls, v):
+        if v <= 0:
+            raise ValueError("time_budget.limit must be positive")
+        return v
+
+
+class DollarBudget(_Model):
+    period: Period
+    limit: float = Field(gt=0.0)
+    """Dollars per period. Only cloud spend counts against it: dstack prices
+    SSH/on-prem instances at zero, so on-prem usage cannot consume it."""
+
+
 class CloudPolicy(_Model):
     """Whether and how a team or user may provision external cloud resources.
 
@@ -110,6 +133,7 @@ class CloudPolicy(_Model):
     """
 
     allowed: bool = False
+    dollar_budget: Optional[DollarBudget] = None
     max_price: Optional[float] = Field(default=None, gt=0.0)
     """Ceiling on instance price in dollars per hour, clamping `max_price`."""
     backends: Optional[List[str]] = None
@@ -140,7 +164,19 @@ class PolicySpec(_Model):
 
     windows: Optional[List[Window]] = None
     max_run_duration: Optional[Duration] = None
+    time_budget: Optional[TimeBudget] = None
     cloud: Optional[CloudPolicy] = None
+
+    def needs_usage(self) -> bool:
+        """Whether enforcing this policy requires the usage snapshot.
+
+        A policy with no budget is decided entirely from the spec and the clock,
+        so it must keep working when the snapshot is missing — otherwise adding
+        budgets to one team would take every other team down with the enforcer.
+        """
+        return self.time_budget is not None or (
+            self.cloud is not None and self.cloud.dollar_budget is not None
+        )
 
     @validator("windows")
     def _reject_empty_windows(cls, v):
@@ -176,6 +212,14 @@ class TeamConfig(_Model):
 class PolicyConfig(_Model):
     version: int
     timezone: str = "UTC"
+    on_usage_unavailable: Literal["deny", "allow"] = "deny"
+    """What to do when a budget must be checked but the usage snapshot is
+    missing or stale. Defaults to denying: a quota layer that opens up when its
+    inputs disappear is not a quota layer. Only affects policies that actually
+    configure a budget."""
+    usage_snapshot_max_age: Duration = 180
+    """How old the snapshot may be before it counts as unavailable. Must exceed
+    the enforcer's refresh interval or every submission fails between cycles."""
     ungoverned_projects: List[str] = []
     """Projects that carry no team policy, typically the infra project that owns
     the shared fleet. Listing one is an explicit admin act: a project that is
@@ -258,7 +302,7 @@ def merge(defaults: PolicySpec, override: PolicySpec) -> PolicySpec:
     since dropping `backends` or `max_price` widens rather than narrows.
     """
     merged = defaults.copy(deep=True)
-    for name in ("windows", "max_run_duration"):
+    for name in ("windows", "max_run_duration", "time_budget"):
         value = getattr(override, name)
         if value is not None:
             setattr(merged, name, value)

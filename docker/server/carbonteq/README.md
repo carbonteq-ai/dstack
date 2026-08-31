@@ -260,9 +260,55 @@ Outside the team's window, the same apply is rejected with the schedule and the
 next opening.
 
 > The build installs `ctpolicy` with `--no-deps` alongside the dstack wheel, so
-> the package must never grow a dependency; see `policy/README.md`. Budgets, the
-> background enforcer and the `dstack-quota` companion command are later phases
-> and are not in this build.
+> the package must never grow a dependency; see `policy/README.md`.
+
+## 8. Budgets and the enforcer
+
+The `enforcer` service runs the same image as the server with a different
+entrypoint. Once a minute it recomputes usage from dstack's own records, writes
+`usage-snapshot.json` into the `policy-state` volume for the plugin to read, and
+looks for runs that have outlived their policy.
+
+**It ships stopping nothing.** `DSTACK_CT_ENFORCER_DRY_RUN` defaults to `true`,
+so breaches are logged as `WOULD STOP` and nothing is terminated. Snapshots are
+still written, so budgets are enforced at admission from the first cycle — only
+termination of already-running work is held back.
+
+```
+docker compose logs -f enforcer
+```
+
+Expect `Snapshot written: N teams, M runs considered` each cycle. When the
+`WOULD STOP` lines look right, arm the backstop by setting
+`DSTACK_CT_ENFORCER_DRY_RUN=false` in Dokploy and redeploying. It stops runs
+gracefully, so `stop_duration` is honoured and the fork's cancellation path
+applies.
+
+Two settings that must stay in step: `DSTACK_CT_ENFORCER_INTERVAL` (60s) has to
+stay **below** `usage_snapshot_max_age` in `policy.yaml` (180s), or teams with
+budgets are rejected in the gaps between cycles. Teams with no budget never read
+the snapshot, so a stopped enforcer cannot affect them.
+
+To see where everything stands:
+
+```
+docker compose exec server dstack-quota
+```
+
+```
+usage as of 2026-08-31 04:09:06 UTC (0s ago)
+
+team-research   priority band 70-99
+  window  mon/tue/wed/thu/fri 08:00-20:00 Asia/Karachi — open, closes in 10h50m
+  max run 12h  time 271h/400h (+12h committed)  cloud $1487.20/$1500.00 (+$61.00 committed)  max $4.00/hr
+  example-intern       max run 2h  time 0m/20h (+0m committed)  cloud off
+  example-researcher   inherits team defaults
+```
+
+`--json` emits the same thing for scripting. It reads the policy file and the
+snapshot directly rather than the API, so it is showing exactly the inputs the
+plugin uses. People on laptops do not need it: a rejection already states the
+limit, what is used and what is committed.
 
 ## Notes
 

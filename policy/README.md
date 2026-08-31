@@ -30,12 +30,18 @@ For each run it:
 It also rejects cloud fleets, volumes and gateways from teams without cloud
 permission.
 
-## Status
+## Components
 
-Phase 1 of the plan. Budgets (time and dollars), the usage snapshot, the
-background enforcer and the `dstack-quota` companion CLI are **not** in this
-build; `time_budget` and `dollar_budget` keys are rejected as unknown rather
-than silently ignored. See the phased build order in `CARBONTEQ_POLICY.md`.
+| Piece | Runs as | Does |
+| --- | --- | --- |
+| `ctpolicy` plugin | inside the dstack server | admission control and spec clamping |
+| `ctpolicy-enforce` | its own container | writes the usage snapshot; stops runs that outlived their policy |
+| `dstack-quota` | a command | read-only view of limits and usage |
+
+All phases of the plan are implemented. The enforcer ships with
+`DSTACK_CT_ENFORCER_DRY_RUN=true` in the deployment, so it writes snapshots —
+which is what makes budgets enforceable at admission — but stops nothing until
+that is turned off.
 
 ## Configuration
 
@@ -45,7 +51,10 @@ One YAML file, read from `$DSTACK_CT_POLICY_FILE` (default
 
 ```yaml
 version: 1                      # only 1 is understood
-timezone: Asia/Karachi          # windows are evaluated in this zone
+timezone: Asia/Karachi          # windows and budget periods use this zone
+
+on_usage_unavailable: deny      # deny | allow, when the snapshot is missing/stale
+usage_snapshot_max_age: 180s    # must exceed the enforcer's interval
 
 ungoverned_projects:            # projects deliberately outside the policy layer
   - main
@@ -63,17 +72,77 @@ teams:
           from: "08:00"
           to: "20:00"
       max_run_duration: 12h
+      time_budget:              # the team's pool of run time
+        period: month           # month | week
+        limit: 400h
       cloud:
         allowed: true
         max_price: 4.0          # dollars per hour, per instance
+        dollar_budget:          # cloud spend only; on-prem is priced at zero
+          period: month
+          limit: 1500
         backends: [nebius]      # which CLOUD backends; on-prem stays reachable
     users:                      # a user must be listed here to run
       alice: {}                 # `{}` inherits the team defaults
       bob:
         max_run_duration: 24h   # user keys override the team's
+        time_budget: {period: week, limit: 20h}
         cloud:
           allowed: false
 ```
+
+### Budgets
+
+`time_budget` counts every run; `dollar_budget` counts only money, and dstack
+prices SSH/on-prem instances at zero, so on-prem usage cannot consume it. That is
+requirement 3 falling out of dstack's own cost model rather than being
+special-cased.
+
+A team's budget lives in its `defaults` and is measured against the whole team's
+usage. A budget written under a user is measured against that user alone, so it
+carves a slice out of the team pool rather than replacing it: **both must have
+room, and the tighter one bounds the run.**
+
+Admission subtracts two things, not one:
+
+```
+remaining = limit − spent − committed
+```
+
+`committed` is what active runs are still entitled to consume under the ceilings
+they were admitted with. Without it, several runs each individually under budget
+could collectively exceed it. Because `max_duration` is enforced by the runner
+inside the VM, that entitlement is a real bound rather than an estimate.
+
+What happens when a budget runs out differs by kind, deliberately:
+
+* **Time budget exhausted** → the run is rejected. There is nothing else to do
+  with it.
+* **Dollar budget exhausted** → the run is *pinned to the on-prem fleet* and
+  admitted. Running out of money stops a team spending, not working. A run that
+  explicitly asked for a cloud backend is rejected instead, so the fallback is
+  never silent.
+
+Otherwise the budget clamps rather than rejects: `max_duration` is tightened to
+what the time budget affords, and — only for a run that can actually reach a paid
+backend — to what the dollar budget affords at the run's `max_price`.
+
+### Usage accounting
+
+Time is measured from a job submission's `submitted_at` to its `finished_at`,
+which is exactly how dstack computes `Run.cost`. Keeping the two consistent
+matters more than excluding queue time, and it errs high: a run that waited is
+charged for waiting. A multi-node run accrues once per job submission, because
+that is the resource it holds.
+
+The apply hook cannot query the database — it runs on a worker thread of the
+server's shared executor while the request still holds a session — so the
+enforcer recomputes usage on its own schedule and writes a small JSON snapshot
+that the hook reads. The snapshot is a **cache, never an authority**: every value
+in it is derived from dstack's own records.
+
+A team with no budget never reads the snapshot at all, so a stopped enforcer
+cannot affect teams that configure none.
 
 ### Merging
 

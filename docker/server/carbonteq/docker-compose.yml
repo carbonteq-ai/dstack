@@ -41,6 +41,7 @@ services:
       retries: 10
 
   server:
+    image: dstack-cp/server:current
     build:
       context: ../../..
       dockerfile: docker/server/carbonteq/Dockerfile
@@ -74,6 +75,8 @@ services:
       # the compiled-in default; it is set explicitly so the bind mount below
       # and the path the plugin reads cannot drift apart.
       DSTACK_CT_POLICY_FILE: /etc/ctpolicy/policy.yaml
+      # Budget usage, written by the enforcer. The server only reads it.
+      DSTACK_CT_USAGE_SNAPSHOT: /var/lib/ctpolicy/usage-snapshot.json
     volumes:
       # Run logs, and anything else dstack keeps on disk. Postgres holds the rest.
       - server-data:/root/.dstack/server
@@ -91,6 +94,23 @@ services:
       # Team and user policy. Unlike config.yml this IS re-read on change, so an
       # edit takes effect on the next `dstack apply` without a restart.
       - ./policy.yaml:/etc/ctpolicy/policy.yaml:ro
+      # Read-only: the enforcer owns this file, the server only consults it.
+      - policy-state:/var/lib/ctpolicy:ro
+    healthcheck:
+      # Lets the enforcer wait for a server that can answer, rather than starting
+      # alongside one that is still migrating and logging a connection failure on
+      # every deploy. Uses the image's own Python; there is no curl in it.
+      test:
+        [
+          "CMD",
+          "/root/.local/share/uv/tools/dstack/bin/python",
+          "-c",
+          "import urllib.request;urllib.request.urlopen('http://localhost:3000/healthcheck',timeout=5)",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
     networks:
       # `default` keeps postgres reachable; `dokploy-network` is what Traefik is
       # on, and without it a Dokploy domain answers 502 because the proxy has no
@@ -100,6 +120,49 @@ services:
     ports:
       # Host port 3000 belongs to Dokploy's own web UI, so default to 3001.
       - "${DSTACK_SERVER_HOST_PORT:-3001}:3000"
+
+  # Recomputes budget usage for the plugin to read, and stops runs that have
+  # outlived their policy. Runs as its own service because dstack has no plugin
+  # hook for background work.
+  #
+  # Same image as the server — it needs the ctpolicy package and the dstack API
+  # client, both of which are already in there — with the entrypoint replaced.
+  # The base image's entrypoint starts the server, so `command:` alone would not
+  # be enough.
+  enforcer:
+    image: dstack-cp/server:current
+    build:
+      context: ../../..
+      dockerfile: docker/server/carbonteq/Dockerfile
+      args:
+        RELEASE_VERSION: ${DSTACK_RELEASE_VERSION:-}
+    entrypoint:
+      ["/usr/bin/tini", "--", "/root/.local/share/uv/tools/dstack/bin/ctpolicy-enforce"]
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      # Reaches the server over the compose network, not the published port.
+      DSTACK_SERVER_URL: http://server:3000
+      # A global admin token: usage has to be computed across every project.
+      # Before production, cut this a dedicated service-account user rather than
+      # reusing the bootstrap admin token.
+      DSTACK_SERVER_ADMIN_TOKEN: ${DSTACK_SERVER_ADMIN_TOKEN:?set an admin token}
+      DSTACK_CT_POLICY_FILE: /etc/ctpolicy/policy.yaml
+      DSTACK_CT_USAGE_SNAPSHOT: /var/lib/ctpolicy/usage-snapshot.json
+      # Must stay below the server's usage_snapshot_max_age (180s by default),
+      # or budgeted teams fail closed between cycles.
+      DSTACK_CT_ENFORCER_INTERVAL: ${DSTACK_CT_ENFORCER_INTERVAL:-60}
+      # Ships stopping nothing. The snapshot is still written, so budgets are
+      # enforced at admission from the first cycle; this only governs whether
+      # already-running work is terminated. Watch the "WOULD STOP" lines in the
+      # logs, then set it to "false" to arm the backstop.
+      DSTACK_CT_ENFORCER_DRY_RUN: ${DSTACK_CT_ENFORCER_DRY_RUN:-true}
+      DSTACK_CT_ENFORCER_LOG_LEVEL: ${DSTACK_CT_ENFORCER_LOG_LEVEL:-INFO}
+    volumes:
+      - ./policy.yaml:/etc/ctpolicy/policy.yaml:ro
+      - policy-state:/var/lib/ctpolicy
 
   # The worker VM downloads the fork's runner and shim from here, so this port
   # must be reachable from the worker over the LAN.
@@ -127,3 +190,6 @@ networks:
 volumes:
   postgres-data:
   server-data:
+  # The usage snapshot the enforcer writes and the server reads. Derived data
+  # only: losing it costs one enforcer cycle, not any policy state.
+  policy-state:

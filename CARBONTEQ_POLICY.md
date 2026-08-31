@@ -2,10 +2,19 @@
 
 ## Status
 
-Phase 1, on branch `dstack-cp-mvp`. Compute windows, run-duration ceilings, the
-cloud permission flag, two-level priority and per-user overrides are enforced.
-Budgets, the usage snapshot, the background enforcer and the `dstack-quota`
-companion CLI are planned but not built; see [Build order](#build-order).
+Complete, on branch `dstack-cp-mvp`. Compute windows, run-duration ceilings, the
+cloud permission flag, two-level priority, per-user overrides, time and dollar
+budgets, the usage snapshot, the enforcer backstop and the `dstack-quota`
+command are all implemented; see [Build order](#build-order).
+
+Two deliberate deployment states to know about:
+
+* The enforcer ships with `DSTACK_CT_ENFORCER_DRY_RUN=true`. It writes usage
+  snapshots from the first cycle — which is what makes budgets enforceable at
+  admission — but logs `WOULD STOP` instead of stopping anything. Set it to
+  `false` to arm the backstop.
+* `policy.yaml` ships with placeholder usernames. It is fail-closed, so real
+  users are rejected until they are listed.
 
 This document is the decision record. [`CARBONTEQ_FORK.md`](CARBONTEQ_FORK.md)
 remains the rebase ledger for changes inside upstream files;
@@ -190,6 +199,38 @@ role model and through owning this file; when an admin submits a run *to a team
 project*, they are subject to that team's policy, which is the correct
 behaviour. Admin work belongs in an ungoverned project.
 
+### 8. An exhausted dollar budget falls back to on-prem rather than rejecting
+
+Running out of money should stop a team *spending*, not stop them *working*. So
+when the cloud budget is gone the run is pinned to the SSH fleet — which dstack
+prices at zero — and admitted. A run that explicitly named a cloud backend is
+rejected instead, so the fallback is never silent about changing where the work
+lands.
+
+The time budget has no such fallback: there is nothing else to do with a run
+that has no time left, so it is rejected.
+
+### 9. A user budget carves a slice out of the team pool
+
+The team budget lives in `defaults` and is measured against the whole team's
+usage. A budget written under a user is measured against that user alone. Both
+must have room and the tighter one bounds the run, so a generous user budget can
+never exceed the pool it comes from.
+
+This is a deliberate exception to "user overrides team" (decision in §5): for
+every other key the user's value simply replaces the team's, but a budget that
+replaced the pool would let one user's entry raise the team's ceiling.
+
+### 10. The enforcer ships stopping nothing
+
+`DSTACK_CT_ENFORCER_DRY_RUN=true` in the deployment. Snapshots are still
+written, so budgets are enforced at admission from the first cycle; only
+termination of already-running work is held back, logged as `WOULD STOP`.
+
+Terminating someone's training run is the most destructive thing this layer
+does, and admission clamps already bound the normal case. Watching the logs
+first costs one config change and buys certainty that the rules match intent.
+
 ## Architecture
 
 ```
@@ -214,31 +255,35 @@ Enforcement lives in three places, only one of which is code we wrote:
 | # | Requirement | Enforced by | Status |
 | --- | --- | --- | --- |
 | 1 | Fixed time windows | plugin rejects when shut; clamps `max_duration` to window close | done |
-| 2 | Max time budget | plugin, against the usage snapshot | phase 2 |
-| 3 | Dollar budget, cloud only | free — SSH is `price = 0`; plus the `max_price` clamp | phase 2 |
+| 2 | Max time budget | plugin, against the usage snapshot; enforcer backstops | done |
+| 3 | Dollar budget, cloud only | free — SSH is `price = 0`; plus the `max_price` clamp and an on-prem fallback when exhausted | done |
 | 4 | NeoCloud boolean | **structural** (no cloud backend in the project, and backends are admin-only) **plus** the plugin pinning `backends` and rejecting cloud fleets/volumes/gateways | done |
 | 5 | Two-level priority | plugin rewrites `priority` into the team's band | done (best-effort, see risks) |
 | 6 | User overrides team | deep merge of `users.<name>` over `defaults` | done |
 | 7 | Reject at submission | `ValueError` → `ServerClientError` → CLI text | done |
 | 8 | Order queued only, never preempt | **native dstack**; we add nothing | done |
-| 9 | Terminate only on window/timeout/budget | the **runner's** `max_duration`; enforcer as backstop | partial |
+| 9 | Terminate only on window/timeout/budget | the **runner's** `max_duration`; enforcer as backstop | done (ships in dry-run) |
 | 10 | Admin absolute control | **native** (`GlobalRole.ADMIN`) plus `default_permissions` | done |
 
 ### Why a snapshot file, not a DB session
 
-Phase 2 needs usage data, and the hook cannot get it directly. It runs on a
+Budgets need usage data, and the hook cannot get it directly. It runs on a
 worker thread of the shared 128-thread executor *while the FastAPI request still
 holds a DB session*; the engine pool is 20 + 20 overflow, and dstack's own
 `db.py` documents that cross-thread access requires a whole new engine rather
 than the shared pool. A loopback HTTP call has the same problem plus a second
 connection per apply.
 
-So the enforcer will recompute usage from dstack's own database on its own
-schedule and write a small JSON snapshot that the plugin reads. The snapshot is
-a **cache, never authority** — nothing we own is load-bearing for a decision —
-and staleness beyond a configured bound fails closed.
+So the enforcer recomputes usage from dstack's own records on its own schedule
+and writes a small JSON snapshot that the plugin reads. The snapshot is a
+**cache, never authority** — nothing we own is load-bearing for a decision — and
+staleness beyond `usage_snapshot_max_age` fails closed.
 
-### Budget soundness (phase 2)
+A team that configures no budget never reads the snapshot at all, so a stopped
+enforcer cannot take down teams that have none. That containment is why the
+check is per-policy rather than global.
+
+### Budget soundness
 
 Clamping is sound only if admission subtracts *committed* cost as well as spent:
 
@@ -286,16 +331,16 @@ head-of-line blocking (decision 2); a run-level `termination_reason_message`
   team projects and locked-down `default_permissions`;
   `dstack export create shared-hw --fleet mvp-workers --global`; move engineers
   to team-project memberships. Delivers isolation on its own.
-- **Phase 1 — the plugin, stateless rules, and the fork delta.** *(this build)*
+- **Phase 1 — the plugin, stateless rules, and the fork delta.** *(done)*
   Config loading with hot reload, windows, the duration ceiling, the cloud flag,
   priority bands, per-user overrides, and the fleet/volume/gateway guards.
   Delivers requirements 1, 4, 5, 6, 7, 8, 10.
-- **Phase 2 — usage snapshot and budgets.** The snapshot writer, the oracle with
+- **Phase 2 — usage snapshot and budgets.** *(done)* The snapshot writer, the oracle with
   staleness handling, and the budget checks with the committed-cost term.
   Delivers requirements 2 and 3.
-- **Phase 3 — `dstack-quota`.** A read-only companion CLI over the same config
+- **Phase 3 — `dstack-quota`.** *(done)* A read-only companion CLI over the same config
   and snapshot, so users can see their position before anything terminates.
-- **Phase 4 — the enforcer backstop.** Terminates runs breaching a window
+- **Phase 4 — the enforcer backstop.** *(done, ships in dry-run)* Terminates runs breaching a window
   boundary, an edited policy, or a budget the clamp could not bound, via
   `stop_runs(abort=False)` so `stop_duration` is honoured. Completes
   requirement 9.
@@ -322,7 +367,7 @@ a real hole.
 means the time budget will be the only lever on the SSH fleet. Worth confirming
 that is intended rather than incidental.
 
-**Usage accuracy (phase 2).** `finished_at` is derived from
+**Usage accuracy.** `finished_at` is derived from
 `last_processed_at`, so figures are approximate to within one pipeline cycle,
 and `price` must be parsed out of a JSON text column rather than read from an
 indexed one. Fleet *idle* time is attributed to nobody — `InstanceModel` has no

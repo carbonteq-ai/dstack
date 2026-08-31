@@ -15,6 +15,13 @@ dependencies = []
 [project.entry-points."dstack.plugins"]
 ctpolicy = "ctpolicy:PolicyPlugin"
 
+[project.scripts]
+# The enforcer runs as its own service; dstack has no plugin hook for background
+# work. dstack-quota is a separate binary because dstack's CLI registers its
+# commands from a hard-coded list with no entry point for third parties.
+ctpolicy-enforce = "ctpolicy.enforcer:main"
+dstack-quota = "ctpolicy.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

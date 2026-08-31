@@ -17,7 +17,8 @@ compatibility is not guaranteed across releases"
 signature is the other thing to re-check on every rebase. See CARBONTEQ_POLICY.md.
 """
 
+from dstack._internal.core.errors import ClientError
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.common import Duration
 
-__all__ = ["BackendType", "Duration"]
+__all__ = ["BackendType", "ClientError", "Duration"]

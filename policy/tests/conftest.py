@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ctpolicy import config as policy_config  # noqa: E402
+from ctpolicy import usage as usage_module  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -32,3 +33,15 @@ def write_policy(tmp_path, monkeypatch):
         return path
 
     return _write
+
+
+@pytest.fixture
+def snapshot_path(tmp_path, monkeypatch) -> Path:
+    """Point the usage loader at a temp file, without creating it.
+
+    Left absent on purpose so a test that forgets to write one exercises the
+    unavailable path rather than silently reading a stale file from disk.
+    """
+    path = tmp_path / "usage-snapshot.json"
+    monkeypatch.setenv(usage_module.SNAPSHOT_FILE_ENV_VAR, str(path))
+    return path
