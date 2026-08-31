@@ -74,6 +74,15 @@ class RunpodBackendConfig(CoreModel):
             )
         ),
     ] = None
+    minimum_stock_status: Annotated[
+        Literal["low", "medium", "high"],
+        Field(
+            description=(
+                "Minimum RunPod live stock status for GPU spot offers. Defaults to `low` "
+                "to preserve upstream behavior"
+            )
+        ),
+    ] = "low"
     provisioning_precondition: Optional[HTTPImageReadinessConfig] = None
     provisioning_timeout_seconds: Annotated[
         Optional[int],

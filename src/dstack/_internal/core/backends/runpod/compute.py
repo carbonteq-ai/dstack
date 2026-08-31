@@ -97,6 +97,7 @@ class RunpodCompute(
                 regions=self.config.regions,
                 allow_community_cloud=self.config.allow_community_cloud,
                 gpu_availability=self.api_client.get_data_center_gpu_availability(),
+                minimum_stock_status=self.config.minimum_stock_status,
             )
         else:
             offers = get_catalog_offers(
@@ -622,6 +623,7 @@ def _get_live_gpu_offers(
     regions: Optional[List[str]],
     allow_community_cloud: bool,
     gpu_availability: dict[str, dict[str, str]],
+    minimum_stock_status: str = "low",
 ) -> List[InstanceOffer]:
     gpu = get_or_error(requirements.resources.gpu)
     min_gpu_count = gpu.count.min or 1
@@ -645,7 +647,9 @@ def _get_live_gpu_offers(
         )
         if offer is not None:
             stock_status = gpu_availability.get(offer.region, {}).get(offer.instance.name, "")
-            if stock_status.lower() not in {"low", "medium", "high"}:
+            stock_rank = {"low": 1, "medium": 2, "high": 3}.get(stock_status.lower(), 0)
+            minimum_stock_rank = {"low": 1, "medium": 2, "high": 3}[minimum_stock_status]
+            if stock_rank < minimum_stock_rank:
                 continue
             offer.backend_data = RunpodOfferBackendData(stock_status=stock_status).dict()
             offers.append(offer)

@@ -140,6 +140,44 @@ def test_spot_gpu_offers_reject_regions_without_reported_stock():
         assert compute.get_offers_by_requirements(requirements) == []
 
 
+def test_spot_gpu_offers_respect_backend_minimum_stock_status():
+    raw_offer = gpuhunt.RawCatalogItem(
+        instance_name="NVIDIA A100 80GB PCIe",
+        location="US-KS-2",
+        price=1.39,
+        cpu=16,
+        memory=125,
+        gpu_vendor="nvidia",
+        gpu_count=1,
+        gpu_name="A100",
+        gpu_memory=80,
+        spot=True,
+        disk_size=None,
+    )
+    compute = RunpodCompute(
+        RunpodConfig(
+            creds=RunpodAPIKeyCreds(api_key="secret"),
+            community_cloud=False,
+            minimum_stock_status="medium",
+        )
+    )
+    requirements = Requirements(
+        resources=ResourcesSpec(gpu="A100:1", disk="20GB"),
+        spot=True,
+    )
+
+    with (
+        patch.object(RunpodProvider, "__init__", return_value=None),
+        patch.object(_RunpodLiveGPUProvider, "get", return_value=[raw_offer]),
+        patch.object(
+            compute.api_client,
+            "get_data_center_gpu_availability",
+            return_value={"US-KS-2": {"NVIDIA A100 80GB PCIe": "Low"}},
+        ),
+    ):
+        assert compute.get_offers_by_requirements(requirements) == []
+
+
 def test_on_demand_offers_keep_using_offline_catalog():
     compute = RunpodCompute(RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret")))
     requirements = Requirements(resources=ResourcesSpec(gpu="A100:1"), spot=False)

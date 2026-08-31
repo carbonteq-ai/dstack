@@ -61,6 +61,12 @@ Secure Cloud discovery, live spot conversion, and preservation of the offline
 on-demand path. A live read-only check returned current RTX PRO 6000 and A100
 80 GB Secure Cloud spot rows in approximately six seconds.
 
+Infrastructure may additionally set `minimum_stock_status` to `low`, `medium`,
+or `high`. The upstream-compatible default remains `low`; CarbonTeq production
+sets `medium`, making Low rows ineligible rather than merely ranking them after
+stronger stock. This provider policy is independent of workload GPU and price
+requirements and is covered by a focused rejection test.
+
 ### Select managed run storage from an infrastructure region pool
 
 Managed RunPod storage may now omit a fixed data center when the backend owns
