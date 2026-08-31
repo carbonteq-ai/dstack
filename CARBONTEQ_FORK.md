@@ -276,8 +276,13 @@ managed-storage, rotation, and cooldown tests (with three PostgreSQL variants
 skipped when PostgreSQL is absent), plus Ruff and `git diff --check`. An
 authenticated read-only live-offer smoke reported `US-MD-1` A100 stock as
 Medium and the remaining eligible US A100 regions as Low; the new ranking put
-`US-MD-1` first despite its higher price. Deployment and the bounded provider
-canary remain release gates.
+`US-MD-1` first despite its higher price. The subsequent provider canary proved
+that `US-MD-1` is not network-volume-capable, deleted the failed empty logical
+volume without a provider leak, and established that backend configuration must
+contain the intersection of GPU stock and volume support. After restricting the
+pool, r16 created `US-KS-2` storage, received no capacity, deleted it, and
+rotated to `CA-MTL-3` with zero active Pods. Full CUDA execution remains open
+because all currently eligible A100 stock is Low.
 
 Before publication, repeat the Python suite with PostgreSQL enabled, build the
 server and both binaries from the immutable candidate commit, and run a live
