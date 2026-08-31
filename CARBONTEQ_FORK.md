@@ -385,9 +385,20 @@ stronger region is available. Because RunPod does not provide a reservable
 capacity lease, provider allocation can still race after selection; the
 existing bounded empty-volume rotation remains the recovery path.
 
+RunPod may also return HTTP 500 after `createNetworkVolume` has actually
+created the resource. The successor gives each logical-volume-and-region pair
+a deterministic provider name, adopts an existing exact name before create,
+and performs bounded read-after-error reconciliation before reporting an
+ambiguous request as failed. Exact-name matches must also agree on region and
+size. This keeps later cooldown retries capable of recovering a delayed
+provider result instead of creating another unowned volume.
+
 Focused RunPod configuration, running-job, submitted-job, run-termination, and
 volume-deletion tests pass. The SQLite migration was exercised from an empty
 database through head and back to its predecessor.
+The ambiguous-create follow-up passes 52 focused RunPod, volume-pipeline,
+managed-storage, rotation, and cooldown tests with 21 PostgreSQL variants
+skipped when PostgreSQL is absent, plus Ruff and `git diff --check`.
 
 ## Rebase and retirement
 
@@ -404,5 +415,5 @@ Server Edition. dstack observed submission through `done`, CUDA reported
 97,887 MiB visible VRAM, and fleet deletion left the RunPod account with zero
 active Pods.
 
-Published fork commit: `f843a6497c2f270bc52fd4a8b27769884c0824a9` on branch
+Published fork commit: `d0268205c768a01c4573689cc68f041692e476b2` on branch
 `codex/registry-default-auth`.
