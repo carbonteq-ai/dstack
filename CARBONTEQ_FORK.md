@@ -134,6 +134,23 @@ The maintained behavior is finite and zero stop duration for task workloads.
 Unbounded `off` is intentionally unsupported until the terminating pipeline
 can continue polling runner state without repeatedly initiating termination.
 
+**"Unsupported" was true of tasks only, and it was degraded rather than blocked**
+(D-20). `configurators/task.py` rejects `off` for tasks; dev environments and
+services map it to `None`, so `StopDuration` reaches the runner as nil. This
+delta then set `killDelay = 0` for that case — and in Go, `cmd.WaitDelay == 0`
+means *no* delay is enforced, not an immediate one. Such a workload received
+SIGINT and was never killed; recovery fell back to the 300-second `remove_at`
+instead of upstream's ten seconds. Upstream had no nil case at all: it set ten
+seconds unconditionally in `NewRunExecutor` and never reassigned it, and this
+delta removed that line when it made the value per-job.
+
+`SetJob` now floors a nil `StopDuration` at `defaultKillDelay` (ten seconds,
+upstream's value). Zero is still zero and still means immediate: `stopImmediately()`
+sends SIGKILL directly, so `WaitDelay` never applies on that path.
+
+`executor_test.go` asserted `assert.Zero(t, ex.killDelay)` for the nil case,
+which pinned the defect rather than the intent. It now asserts the floor.
+
 ### Deliver cancellation to the job's process group
 
 A bounded stop duration is useless if the workload never learns it should stop.
@@ -171,6 +188,22 @@ Regression coverage is
 `runner/internal/runner/executor/executor_test.go`, which reproduces the
 production interactive-shell entrypoint and asserts that the workload runs its
 own interrupt trap.
+
+**Retirement condition, which this entry lacked.** At 83 lines this is the
+largest production hunk in the fork, and the only retirement clause that
+mentioned the executor was `stop_duration`'s — so retiring on *that* condition
+would have silently dropped this too, reintroducing the bug it fixes. They are
+independent: a bounded stop duration is useless if the signal never reaches the
+workload, and the signal reaching the workload is useful whatever the deadline
+is.
+
+Retire this delta only when upstream signals the **terminal's foreground
+process group** rather than `cmd.Process` — check `startCommand()`'s cancel
+function for a `TIOCGPGRP` lookup or an equivalent, not merely for a changed
+signal or a new setting. If upstream instead stops running the workload under
+`/bin/sh -i -c`, the premise disappears and the delta can go; verify by reading
+`JobConfigurator._commands`, because a non-interactive shell does not enable job
+control and the process group question does not arise.
 
 `TestExecutor_MaxDuration` previously asserted the error text `killed`. That
 encoded the defect: the workload ignored the graceful signal and survived until
@@ -378,6 +411,36 @@ Docker cancellation whose handler takes more than ten seconds but less than
 the configured stop duration. The release must prove the finalizer marker,
 Trackio terminal state, container removal, and worker-idle state.
 
+### Digest-pinned build bases
+
+`Dockerfile` pins its upstream base by digest (`BASE_IMAGE`, line 13).
+`Dockerfile.binaries` did not: it floated on `golang:1.25-bookworm` and
+`nginx:alpine`, and it is the build that produces the runner and shim **every
+worker downloads and executes**, with `CGO_ENABLED=1` for the shim — so the
+toolchain and the C library behind it are part of the artifact. A moved tag
+would change what lands on the fleet with every pin in the consumer repository
+unchanged. Both are digest-pinned now.
+
+Bumping either is a deliberate edit here plus a rebuild and republish of the
+binaries image, exactly as for the server base.
+
+### The root `.dockerignore`
+
+Not a behaviour change, and recorded here because it changes the context of
+**every** docker build from this tree and nothing else documents it.
+
+Without it a build ships the whole working tree to the daemon — over a gigabyte
+once a local `.venv` exists, against roughly 50 MB of source. The exception that
+matters is the git ref metadata: `docker/server/carbonteq/version.sh` resolves
+HEAD from `.git/HEAD`, `.git/refs` and `.git/packed-refs` to derive the release
+version without a git binary, so those are re-included after `.git` is excluded.
+
+**Rebase surface: none** — upstream has no root `.dockerignore`, so there is
+nothing to conflict with. **Retirement: never, while the carbonteq Dockerfiles
+build from this tree.** Deleting it does not fail a build; it makes every build
+slow, and dropping the three `!.git/…` re-includes breaks `version.sh` with an
+empty version rather than an error.
+
 ## Rebase and retirement
 
 Rebase from the exact upstream tag or commit, then inspect the runner payload
@@ -400,11 +463,31 @@ sites — submission in `services/runs/__init__.py` and post-execution in
 `background/pipeline_tasks/runs/terminating.py` — as one conflict-sensitive
 group.
 
-The failure to guard against is losing `after_execution=True` at the terminating
-call site. Nothing breaks loudly: every held run simply becomes recurring, firing
-once per window forever, and the first symptom is a duplicated workload rather
-than an error. A rebase that takes upstream's version of that line reintroduces
-it silently, which is why `TestOneShotDeferredStart` asserts the negative case.
+The failure to guard against is a held run becoming recurring: it fires once per
+window forever, nothing breaks loudly, and the first symptom is a duplicated
+workload rather than an error.
+
+**This note used to name the wrong line** (D-21). It said the hazard was losing
+`after_execution=True` at the terminating call site. That kwarg is passed only
+where it cannot be read — the call sits inside
+`if run_spec.merged_profile.schedule is not None`, and `after_execution` is
+consulted only in `_get_next_triggered_at()`'s `schedule is None` branch. For a
+`start_after`-only run the call never happens. Deleting the kwarg changes
+nothing.
+
+**The line that actually protects this is upstream's**
+`if run_spec.merged_profile.schedule is not None` in `_get_run_update_map()`
+(`background/pipeline_tasks/runs/terminating.py`) — a line the fork does not
+touch, which is precisely why a rebase can widen it without anyone noticing.
+The plausible widening is `schedule is not None or start_after is not None`.
+
+`TestOneShotDeferredStart` does not cover this. It calls
+`_get_next_triggered_at()` directly and **stays green through that exact
+change** — verified by making it. The test that catches it is
+`test_a_one_shot_deferred_start_terminates_rather_than_re_pending` in
+`src/tests/_internal/server/background/pipeline_tasks/test_runs/test_termination.py`,
+which goes through the pipeline. Keep both: one pins the function's contract,
+the other pins that production reaches it.
 
 Adding a field to `ProfileParams` also carries a test tax that is easy to
 misread as breakage: several suites compare a whole serialized profile against a

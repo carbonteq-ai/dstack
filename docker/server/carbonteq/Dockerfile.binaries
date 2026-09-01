@@ -11,13 +11,18 @@
 # run the same script over the same context, which is what makes them agree.
 ARG VERSION=""
 
-FROM golang:1.25-bookworm AS version
+# Digest-pinned, like the server image's base (Dockerfile:13). The tags float,
+# and this build produces the runner and shim that every worker downloads and
+# executes — with CGO_ENABLED=1 for the shim, so the toolchain and the C library
+# behind it are part of the artifact. A moved tag would change the binaries that
+# land on the fleet with every pin in this repository unchanged.
+FROM golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS version
 WORKDIR /version
 COPY docker/server/carbonteq/version.sh ./
 COPY .git .git
 RUN sh version.sh > /release-version && cat /release-version
 
-FROM golang:1.25-bookworm AS build
+FROM golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS build
 ARG VERSION
 ARG TARGETARCH=amd64
 COPY --from=version /release-version /release-version
@@ -37,7 +42,7 @@ RUN set -eu; \
         go build -ldflags "-X 'main.Version=${v}'" \
         -o /out/dstack-shim-linux-${TARGETARCH} github.com/dstackai/dstack/runner/cmd/shim
 
-FROM nginx:alpine
+FROM nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913
 ARG VERSION
 COPY --from=version /release-version /release-version
 COPY --from=build /out/ /binaries/
