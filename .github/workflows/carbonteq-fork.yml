@@ -1,0 +1,125 @@
+name: CarbonTeq fork
+
+# Upstream's `build.yml` triggers on `master` only, so until now a push to a
+# fork branch ran no CI at all — including the changes that ARE the fork.
+#
+# This runs the delta's own regression tests plus the invariants a rebase can
+# quietly drop. Every assertion below was confirmed to fail against the defect
+# it guards; where it could not be, the step says so.
+
+on:
+  push:
+    branches: ["dstack-cp-mvp", "dstack-cp-mvp-**"]
+  pull_request:
+    branches: ["dstack-cp-mvp", "dstack-cp-mvp-**"]
+  workflow_dispatch:
+
+jobs:
+  guards:
+    name: The lines a rebase can silently drop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # D-20. In Go, `cmd.WaitDelay == 0` enforces NO kill. Upstream set ten
+      # seconds unconditionally in the constructor; this fork made the value
+      # per-job and, for a while, left nil meaning zero — so a workload with no
+      # stop_duration took SIGINT and was never killed.
+      - name: A nil StopDuration is still killable
+        run: |
+          f=runner/internal/runner/executor/executor.go
+          grep -q 'const defaultKillDelay' "$f" \
+            || { echo "::error::defaultKillDelay is gone — a nil StopDuration would disable the kill (D-20)"; exit 1; }
+          grep -q 'ex.killDelay = defaultKillDelay' "$f" \
+            || { echo "::error::SetJob no longer floors killDelay; nil StopDuration means WaitDelay=0, which is NO kill (D-20)"; exit 1; }
+          if grep -qE '^\s*ex\.killDelay = 0\s*$' "$f"; then
+            echo "::error::SetJob sets killDelay = 0 again (D-20)"; exit 1
+          fi
+
+      # D-21. The guard that keeps a one-shot `start_after` hold from becoming
+      # recurring is UPSTREAM's line, which is why a rebase can widen it without
+      # anyone noticing. `after_execution` is not the guard: it is passed inside
+      # this same branch and is only read in the other one.
+      - name: The one-shot hold's real guard is intact
+        run: |
+          f=src/dstack/_internal/server/background/pipeline_tasks/runs/terminating.py
+          grep -q 'if run_spec.merged_profile.schedule is not None and termination_reason not in {' "$f" \
+            || { echo "::error::the terminating guard changed shape — a start_after hold may now recur (D-21)"; exit 1; }
+          if grep -qE 'schedule is not None or .*start_after' "$f"; then
+            echo "::error::the guard was broadened to include start_after — every window hold becomes recurring (D-21)"; exit 1
+          fi
+
+      # A6. Upstream calls apply_plugin_policies() from get_plan() and
+      # apply_plan() only, so the deprecated /runs/submit route reaches
+      # submit_run() with no policy pass and an unsigned run is ACCEPTED.
+      - name: The submit route still applies plugin policies
+        run: |
+          grep -q 'apply_plugin_policies' src/dstack/_internal/server/routers/runs.py \
+            || { echo "::error::/runs/submit no longer applies policies — the guardrail bypass is reopened (A6)"; exit 1; }
+
+      # Both build bases are content-addressed. The binaries image produces the
+      # runner and shim every worker downloads and executes.
+      - name: Both Dockerfiles pin their bases by digest
+        run: |
+          for f in docker/server/carbonteq/Dockerfile docker/server/carbonteq/Dockerfile.binaries; do
+            while read -r line; do
+              case "$line" in
+                *'${BASE_IMAGE}'*|*@sha256:*) ;;
+                *) echo "::error::$f has an unpinned base: $line"; exit 1 ;;
+              esac
+            done < <(grep '^FROM ' "$f")
+          done
+          grep -q 'ARG BASE_IMAGE=.*@sha256:' docker/server/carbonteq/Dockerfile \
+            || { echo "::error::BASE_IMAGE has no digest"; exit 1; }
+
+      # version.sh resolves HEAD without a git binary, so the build context must
+      # keep the ref metadata. Dropping the re-includes yields an EMPTY version
+      # rather than an error, and the images then disagree about what they are.
+      - name: The build context keeps the git refs version.sh reads
+        run: |
+          for keep in '!.git/HEAD' '!.git/refs' '!.git/packed-refs'; do
+            grep -qxF "$keep" .dockerignore \
+              || { echo "::error::.dockerignore drops $keep — version.sh resolves an empty version"; exit 1; }
+          done
+
+  go:
+    name: Runner tests (the cancellation and stop-duration deltas)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: runner/go.mod
+          cache-dependency-path: runner/go.sum
+      - run: go vet ./internal/runner/executor/... ./internal/runner/schemas/...
+      - name: Executor and schema tests
+        run: go test ./internal/runner/executor/... ./internal/runner/schemas/... -count=1
+
+  python:
+    name: Server tests for every maintained delta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[all,server]' -r requirements_dev.txt
+      - name: The delta's own regression coverage
+        run: |
+          pytest -q \
+            src/tests/_internal/server/services/runs/test_runs.py \
+            src/tests/_internal/server/services/runner/test_client.py \
+            src/tests/_internal/server/services/jobs/configurators/test_task.py \
+            src/tests/_internal/server/background/pipeline_tasks/test_terminating_jobs.py \
+            src/tests/_internal/server/background/pipeline_tasks/test_runs/test_termination.py \
+            src/tests/plugins/test_rest_plugin.py
+      - name: The named cases, by name, so a rename is a failure and not a skip
+        run: |
+          pytest -q \
+            'src/tests/_internal/server/services/runs/test_runs.py::TestOneShotDeferredStart' \
+            'src/tests/_internal/server/background/pipeline_tasks/test_runs/test_termination.py::TestRunTerminatingWorker::test_a_one_shot_deferred_start_terminates_rather_than_re_pending' \
+            'src/tests/_internal/server/routers/test_runs.py::TestSubmitRun::test_applies_plugin_policies_that_reject' \
+            'src/tests/_internal/server/routers/test_runs.py::TestSubmitRun::test_persists_the_spec_a_plugin_policy_returns'

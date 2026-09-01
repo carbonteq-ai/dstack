@@ -80,7 +80,11 @@ func TestExecutor_SetJobUsesStopDuration(t *testing.T) {
 	assert.Equal(t, 37*time.Second, ex.killDelay)
 }
 
-func TestExecutor_SetJobLeavesStopDurationOffUnbounded(t *testing.T) {
+// CARBONTEQ: renamed from ...LeavesStopDurationOffUnbounded, which described
+// the defect rather than the intent (D-20). "Unbounded" was the bug: WaitDelay
+// of zero means Go enforces no kill at all, so such a job took SIGINT and then
+// ran until the 300s remove_at.
+func TestExecutor_SetJobFloorsAnAbsentStopDuration(t *testing.T) {
 	ex := makeTestExecutor(t)
 
 	ex.SetJob(schemas.SubmitBody{
@@ -89,7 +93,11 @@ func TestExecutor_SetJobLeavesStopDurationOffUnbounded(t *testing.T) {
 		},
 	})
 
-	assert.Zero(t, ex.killDelay)
+	// CARBONTEQ: NOT zero. cmd.WaitDelay = 0 disables Go's kill entirely, so a
+	// job with no stop_duration would take SIGINT and never be killed. This
+	// asserted Zero and therefore pinned the defect in place.
+	assert.Equal(t, defaultKillDelay, ex.killDelay)
+	assert.NotZero(t, ex.killDelay, "zero WaitDelay means Go enforces no kill at all")
 }
 
 func TestStopImmediately(t *testing.T) {

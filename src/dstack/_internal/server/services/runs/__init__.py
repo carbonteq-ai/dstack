@@ -1239,10 +1239,26 @@ def _get_next_triggered_at(
     run_spec: RunSpec, *, after_execution: bool = False
 ) -> Optional[datetime]:
     if run_spec.merged_profile.schedule is None:
-        # CARBONTEQ: the one-shot deferred start. `after_execution` is the
-        # terminating pipeline asking for the *next* trigger — for a one-shot
-        # there is not one, and answering with the same instant again is exactly
-        # how a single held run becomes a recurring one.
+        # CARBONTEQ: the one-shot deferred start.
+        #
+        # `after_execution` means "the terminating pipeline is asking for the
+        # NEXT trigger". A one-shot has none, and answering with the same
+        # instant again is how a single held run would become a recurring one.
+        #
+        # BUT THIS BRANCH IS NOT WHAT PREVENTS THAT, and CARBONTEQ_FORK.md said
+        # for a while that it was. The terminating pipeline only reaches here
+        # inside `if run_spec.merged_profile.schedule is not None` — see
+        # background/pipeline_tasks/runs/terminating.py, `_get_run_update_map`
+        # — so for a `start_after`-only run the call never happens and this
+        # kwarg is never read. It is defence in depth, not the guard.
+        #
+        # THE REAL GUARD IS UPSTREAM'S `schedule is not None` in that function,
+        # a line this fork does not touch. If a rebase ever broadens it — to
+        # `schedule is not None or start_after is not None`, say, which is a
+        # plausible upstream change — every held run becomes recurring in
+        # production. `TestOneShotDeferredStart` covers this function directly
+        # and would stay green through it, so the test that matters is the
+        # pipeline-level one beside it.
         if after_execution:
             return None
         return run_spec.merged_profile.start_after

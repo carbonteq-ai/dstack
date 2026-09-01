@@ -130,6 +130,13 @@ def _get_job_id_to_update_map(
 def _get_run_update_map(run_model: models.RunModel) -> TerminatingRunUpdateMap:
     termination_reason = get_or_error(run_model.termination_reason)
     run_spec = get_run_spec(run_model)
+    # CARBONTEQ: this `schedule is not None` is the guard that keeps a one-shot
+    # `start_after` run from being rescheduled forever. It is upstream's line and
+    # the fork does not touch it — which is exactly why it is easy to lose in a
+    # rebase without noticing. Broadening it to include `start_after` turns every
+    # compute-window hold into a recurring job, and the fork's own
+    # `TestOneShotDeferredStart` stays green through that (verified).
+    # `test_termination.py::…_one_shot_deferred_start_terminates…` is what catches it.
     if run_spec.merged_profile.schedule is not None and termination_reason not in {
         RunTerminationReason.ABORTED_BY_USER,
         RunTerminationReason.STOPPED_BY_USER,

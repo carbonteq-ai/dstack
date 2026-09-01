@@ -90,6 +90,10 @@ type RunExecutor struct {
 	connectionTracker ConnectionTracker
 }
 
+// CARBONTEQ: the floor for a job that specifies no stop_duration. Upstream's
+// constructor value, kept because zero disables Go's kill entirely.
+const defaultKillDelay = 10 * time.Second
+
 func NewRunExecutor(tempDir string, dstackDir string, currentUser linuxuser.User, sshd ssh.SshdManager) (*RunExecutor, error) {
 	mu := &sync.RWMutex{}
 	timestamp := NewMonotonicTimestamp()
@@ -275,7 +279,23 @@ func (ex *RunExecutor) SetJob(body schemas.SubmitBody) {
 	ex.run = body.Run
 	ex.jobSubmission = body.JobSubmission
 	ex.jobSpec = body.JobSpec
-	ex.killDelay = 0
+	// CARBONTEQ: a nil StopDuration must still be killable.
+	//
+	// Upstream set killDelay to 10s unconditionally in the constructor and
+	// never reassigned it. This delta made it per-job so a bounded
+	// stop_duration reaches the runner — but it also introduced a nil case,
+	// and `cmd.WaitDelay = 0` means Go enforces NO delay at all, not an
+	// immediate one. Such a job takes SIGINT and is then never killed;
+	// recovery falls back to the 300s remove_at instead of ten seconds.
+	//
+	// `stop_duration: off` is still reachable: configurators/task.py rejects
+	// it for TASKS only, and dev environments and services map it to None ->
+	// StopDuration == nil. CARBONTEQ_FORK.md called "off" unsupported, which
+	// was true of the error path and not of this one.
+	//
+	// StopDuration == 0 is a different case and is not floored here:
+	// stopImmediately() sends SIGKILL directly, so WaitDelay never applies.
+	ex.killDelay = defaultKillDelay
 	if body.JobSpec.StopDuration != nil {
 		ex.killDelay = time.Duration(*body.JobSpec.StopDuration) * time.Second
 	}

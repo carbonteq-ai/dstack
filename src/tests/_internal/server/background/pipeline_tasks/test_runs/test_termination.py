@@ -230,6 +230,58 @@ class TestRunTerminatingWorker:
         assert run.lock_expires_at is None
         assert run.lock_owner is None
 
+    @freeze_time(datetime(2023, 1, 2, 3, 10, tzinfo=timezone.utc))
+    async def test_a_one_shot_deferred_start_terminates_rather_than_re_pending(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        """CARBONTEQ: the guard the fork's own note used to get wrong.
+
+        `start_after` holds a run once. If it were rescheduled the way a cron
+        is, every compute-window hold would silently become a recurring job —
+        which is the whole reason `schedule` could not be reused for windows.
+
+        What prevents it is upstream's `schedule is not None` in
+        `_get_run_update_map`, NOT the `after_execution` kwarg the fork adds to
+        `_get_next_triggered_at`: that call sits inside the same branch, so for
+        a `start_after`-only run it never happens and the kwarg is never read.
+        `TestOneShotDeferredStart` calls that function directly and would stay
+        green if the guard were broadened. This goes through the pipeline, so
+        it would not.
+        """
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            run_name="held-run",
+            configuration=TaskConfiguration(
+                nodes=1,
+                start_after=datetime(2023, 1, 2, 3, 0, tzinfo=timezone.utc),
+                commands=["echo Hi!"],
+            ),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_name="held-run",
+            run_spec=run_spec,
+            status=RunStatus.TERMINATING,
+            termination_reason=RunTerminationReason.ALL_JOBS_DONE,
+            resubmission_attempt=1,
+        )
+        lock_run(run)
+        await session.commit()
+
+        await worker.process(run_to_pipeline_item(run))
+
+        await session.refresh(run)
+        assert run.status == RunStatus.DONE, "a one-shot hold must not go back to PENDING"
+        assert run.next_triggered_at is None, "and must carry no next trigger"
+
     async def test_noops_when_run_lock_changes_after_processing(
         self, test_db, session: AsyncSession, worker: RunWorker
     ) -> None:
