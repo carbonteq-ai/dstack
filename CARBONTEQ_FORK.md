@@ -262,6 +262,32 @@ while a cron still does — and
 `test_creates_pending_run_if_run_has_a_one_shot_start` in
 `src/tests/_internal/server/routers/test_runs.py`.
 
+## Fixed: version.sh described the wrong repository
+
+`version.sh` exists so a release version cannot be forgotten. Both of its
+documented invocations were broken (defect D-7):
+
+- from inside a submodule checkout it exited 1 — `usable_git_repo` probed for
+  `.git/objects`, and a submodule's `.git` is a *file* holding a `gitdir:`
+  pointer, so a perfectly usable checkout was called unusable and the raw reader
+  then failed on the same file;
+- from a consumer repository that vendors this one, it returned the CONSUMER's
+  HEAD with exit 0 — tagging an image with a foreign commit, silently.
+
+The second is the dangerous one: the version looks well-formed and pins nothing,
+and a version that does not move is exactly how workers silently keep old
+binaries.
+
+It now resolves against its own location rather than the caller's cwd, probes
+with `git rev-parse --git-dir` so a pointer file works, and asserts the resolved
+commit's tree actually contains `src/dstack/version.py` — if it does not, this
+is somebody else's history and the script fails rather than guessing.
+
+Root discovery tries three candidates because two layouts must work: a normal
+checkout, where the script is three levels below the root, and the image builds,
+which COPY it alone into a flat WORKDIR beside a trimmed `.git`. Verified in
+both, including a real `--target version` build.
+
 ## Compatibility and release
 
 Build the server, runner, and shim from the same fork commit and give the

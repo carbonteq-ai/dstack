@@ -20,7 +20,29 @@
 set -eu
 
 UPSTREAM_TAG="${UPSTREAM_TAG:-0.20.29}"
-GIT_DIR="${GIT_DIR:-.git}"
+
+# Resolve against THIS tree, not the caller's. The script lives at
+# <root>/docker/server/carbonteq/version.sh, so the root is three levels up.
+#
+# Without this the script answers about whatever repository the shell happens to
+# be standing in: run from a consumer repo that vendors this one as a submodule,
+# `git rev-parse HEAD` returns the CONSUMER's commit and the image is tagged with
+# a foreign sha — silently, with exit 0. That is worse than failing, because the
+# version looks well-formed and pins nothing.
+# Two layouts have to work. In a checkout the script sits at
+# <root>/docker/server/carbonteq/version.sh. In the image builds it is COPYed
+# alone into a flat WORKDIR next to a trimmed .git, so three levels up would
+# climb out of the build context entirely — hence "the first candidate that has
+# a .git" rather than a fixed depth.
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$SCRIPT_DIR
+for candidate in "$SCRIPT_DIR/../../.." "$SCRIPT_DIR" "$PWD"; do
+    if [ -e "$candidate/.git" ]; then
+        REPO_ROOT=$(CDPATH='' cd -- "$candidate" && pwd)
+        break
+    fi
+done
+GIT_DIR="${GIT_DIR:-$REPO_ROOT/.git}"
 
 fail() {
     echo "version.sh: $1" >&2
@@ -56,20 +78,36 @@ resolve_head_from_git_dir() {
     esac
 }
 
-# A trimmed .git has refs but no object database, and git refuses to operate on
-# it. Checking for objects/ is what routes the Docker builds to the reader above
-# rather than to a git that would fail confusingly.
+# Whether git can answer about REPO_ROOT.
+#
+# Asking git itself rather than looking for `.git/objects`: a submodule's `.git`
+# is a FILE holding a `gitdir:` pointer, so the directory probe called a perfectly
+# usable checkout unusable and fell through to the raw reader, which then failed
+# on the same file. `--git-dir` follows the pointer and answers correctly for
+# both layouts.
+#
+# The Docker builds still take the reader below, because their context carries
+# `.git/HEAD` and refs but no object database, and `rev-parse` needs objects.
 usable_git_repo() {
     command -v git >/dev/null 2>&1 &&
-        [ -d "$GIT_DIR/objects" ] &&
-        git rev-parse --git-dir >/dev/null 2>&1
+        git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 &&
+        [ -n "$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null)" ]
 }
 
 if [ $# -gt 0 ]; then
     command -v git >/dev/null 2>&1 || fail "resolving '$1' needs the git binary"
-    commit=$(git rev-parse "$1")
+    commit=$(git -C "$REPO_ROOT" rev-parse "$1")
 elif usable_git_repo; then
-    commit=$(git rev-parse HEAD)
+    commit=$(git -C "$REPO_ROOT" rev-parse HEAD)
+
+    # The commit must belong to THIS project. If the resolved tree has no
+    # src/dstack/version.py we are describing somebody else's history — the
+    # exact failure this guard exists for — and a wrong version is worse than
+    # no version, because it tags an image that workers will never be told to
+    # upgrade to.
+    if ! git -C "$REPO_ROOT" cat-file -e "$commit:src/dstack/version.py" 2>/dev/null; then
+        fail "commit $commit has no src/dstack/version.py — that is not this repository"
+    fi
 else
     commit=$(resolve_head_from_git_dir)
 fi
