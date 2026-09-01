@@ -4,6 +4,7 @@ from typing import Dict, Optional, Type
 
 import requests
 from pydantic import ValidationError
+from pydantic.json import pydantic_encoder
 
 from dstack._internal.core.compatibility.fleets import get_fleet_spec_excludes
 from dstack._internal.core.compatibility.gateways import get_gateway_spec_excludes
@@ -58,7 +59,32 @@ class CustomApplyPolicy(ApplyPolicy):
         try:
             response = requests.post(
                 f"{self._plugin_service_uri}{endpoint}",
-                json=spec_request.dict(exclude={"spec": excludes}),
+                # CARBONTEQ: encode with pydantic's encoder, not the stdlib's.
+                #
+                # .dict() leaves datetimes as datetimes and requests encodes
+                # with the stdlib json, which raises TypeError on them. That
+                # kills the apply before the plugin service is ever reached, and
+                # neither handler below catches it: _call_plugin_service catches
+                # ConnectionError and RequestException, apply_plugin_policies
+                # catches ValueError.
+                #
+                # It surfaced the moment a spec carried `start_after`, which is
+                # the whole compute-window feature. Any future field with a
+                # non-JSON-native type would do the same, so the serialiser is
+                # the fix rather than that one field.
+                #
+                # Still .dict() and not .json(): the override in _models.py pops
+                # __orig_class__, and pydantic v1's .json() goes through _iter()
+                # rather than dict(), so it would reintroduce the
+                # "_GenericAlias is not JSON serializable" bug that override
+                # exists to prevent. Both problems are serialisation; they need
+                # different halves of the answer.
+                json=json.loads(
+                    json.dumps(
+                        spec_request.dict(exclude={"spec": excludes}),
+                        default=pydantic_encoder,
+                    )
+                ),
                 headers={"accept": "application/json", "Content-Type": "application/json"},
                 timeout=PLUGIN_REQUEST_TIMEOUT_SEC,
             )

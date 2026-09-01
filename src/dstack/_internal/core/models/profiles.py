@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union, overload
 
@@ -445,6 +445,23 @@ class ProfileParams(CoreModel):
             )
         ),
     ] = None
+
+    @validator("start_after")
+    def _start_after_is_utc(cls, v: Optional[datetime]) -> Optional[datetime]:
+        """Normalise to aware UTC.
+
+        `next_triggered_at` is a NaiveDateTime column that strips tzinfo on the
+        way in and re-attaches UTC on the way out, so a naive local time or a
+        non-UTC offset would be stored as though it were UTC and the run would
+        fire at the wrong hour — silently, and only in whatever timezone the
+        submitter happened to be in.
+        """
+        if v is None:
+            return v
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc)
+
     fleets: Annotated[
         Optional[
             list[

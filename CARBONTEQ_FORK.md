@@ -288,6 +288,46 @@ checkout, where the script is three levels below the root, and the image builds,
 which COPY it alone into a flat WORKDIR beside a trimmed `.git`. Verified in
 both, including a real `--target version` build.
 
+## Fixed: the compute-window hold never dispatched
+
+The deferred start shipped and never worked (defect D-1). A spec carrying
+`start_after` killed the apply *before* the guardrail was reached:
+
+```
+TypeError: Object of type datetime is not JSON serializable
+```
+
+`get_profile_excludes` does not drop `start_after`, so it reached
+`rest_plugin`, which serialised with pydantic-v1 `.dict()` — keeping the
+datetime — and handed it to `requests.post(json=…)`, which encodes with the
+stdlib. Nothing caught it: `_call_plugin_service` catches `ConnectionError` and
+`RequestException`, `apply_plugin_policies` catches `ValueError`, and a
+`TypeError` is neither.
+
+Two halves, because there are two serialisation problems in one call:
+
+- the payload is now encoded with `pydantic_encoder`, which handles datetimes;
+- it still goes through `.dict()` rather than `.json()`, because the override in
+  `_models.py` pops `__orig_class__` and pydantic v1's `.json()` bypasses
+  `dict()` via `_iter()` — using it reintroduces the
+  `_GenericAlias is not JSON serializable` bug that override exists to prevent.
+  That was verified by breaking the suite with it.
+
+`start_after` also gains a validator normalising to aware UTC.
+`next_triggered_at` is a `NaiveDateTime` column that strips tzinfo going in and
+re-attaches UTC coming out, so a naive local time would have been stored as
+though it were UTC and the run would fire at the wrong hour, silently, and only
+for submitters outside UTC.
+
+The regression test is
+`test_on_apply_posts_an_encodable_payload_with_a_deferred_start`, and it asserts
+the payload is *encodable* rather than that the call happened. That distinction
+is the point: every other test in that file mocks `requests.post` and never
+inspects what it was given, which is why `_models.py` already carried a note
+that this class of failure "doesn't happen though when running the code in
+pytest, only when running the server". Confirmed it fails against the old
+serialisation before being trusted.
+
 ## Compatibility and release
 
 Build the server, runner, and shim from the same fork commit and give the

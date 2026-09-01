@@ -1,6 +1,7 @@
 import json
 import os
 from contextlib import nullcontext as does_not_raise
+from datetime import datetime, timezone
 from unittest.mock import Mock
 
 import pytest
@@ -122,6 +123,44 @@ class TestRESTPlugin:
         mocker.patch("requests.post", return_value=mock_response)
         result = policy.on_apply(user=user.name, project=project.name, spec=spec)
         assert result == type(spec)(**response_dict["spec"])
+
+    # CARBONTEQ. This is the test the previous instance of this bug did not have.
+    #
+    # `_models.py` already carries a note that a serialisation failure "doesn't
+    # happen though when running the code in pytest, only when running the
+    # server" — because every other test here mocks `requests.post` and never
+    # looks at what was handed to it. So a spec that cannot be encoded passes
+    # the suite and dies in production.
+    #
+    # `start_after` is a datetime. pydantic v1's `.dict()` leaves it as one, and
+    # requests encodes with the stdlib json, which raises TypeError — killing
+    # the apply before the plugin service is reached, and caught by neither
+    # handler: `_call_plugin_service` catches ConnectionError and
+    # RequestException, `apply_plugin_policies` catches ValueError.
+    #
+    # That is the entire compute-window feature, so this asserts the payload is
+    # actually encodable rather than that the call was made.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize("spec", ["run_spec"], indirect=True)
+    async def test_on_apply_posts_an_encodable_payload_with_a_deferred_start(
+        self, mocker, test_db, user, project, spec
+    ):
+        mocker.patch.dict(os.environ, {PLUGIN_SERVICE_URI_ENV_VAR_NAME: "http://mock"})
+        spec.configuration.start_after = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
+
+        mock_response = Mock()
+        mock_response.text = json.dumps({"spec": json.loads(spec.json()), "error": None})
+        mock_response.raise_for_status = Mock()
+        post = mocker.patch("requests.post", return_value=mock_response)
+
+        CustomApplyPolicy().on_apply(user=user.name, project=project.name, spec=spec)
+
+        payload = post.call_args.kwargs["json"]
+        # The assertion that matters: requests would do exactly this, and it is
+        # where the TypeError came from.
+        json.dumps(payload)
+        assert payload["spec"]["configuration"]["start_after"] == "2026-09-01T08:00:00+00:00"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
