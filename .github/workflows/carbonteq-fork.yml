@@ -103,13 +103,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Matches build-artifacts.yml, which is how this project actually
+      # installs. The first version of this job invented
+      # `pip install -e '.[all,server]' -r requirements_dev.txt` — there is no
+      # requirements_dev.txt in this tree, and it failed in eight seconds.
+      - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
-      - run: pip install -e '.[all,server]' -r requirements_dev.txt
+      - name: Install dependencies
+        run: uv sync --all-extras
       - name: The delta's own regression coverage
         run: |
-          pytest -q \
+          uv run pytest -q \
             src/tests/_internal/server/services/runs/test_runs.py \
             src/tests/_internal/server/services/runner/test_client.py \
             src/tests/_internal/server/services/jobs/configurators/test_task.py \
@@ -118,7 +123,7 @@ jobs:
             src/tests/plugins/test_rest_plugin.py
       - name: The named cases, by name, so a rename is a failure and not a skip
         run: |
-          pytest -q \
+          uv run pytest -q \
             'src/tests/_internal/server/services/runs/test_runs.py::TestOneShotDeferredStart' \
             'src/tests/_internal/server/background/pipeline_tasks/test_runs/test_termination.py::TestRunTerminatingWorker::test_a_one_shot_deferred_start_terminates_rather_than_re_pending' \
             'src/tests/_internal/server/routers/test_runs.py::TestSubmitRun::test_applies_plugin_policies_that_reject' \
