@@ -89,7 +89,7 @@ class RunpodCompute(
         self.api_client = RunpodApiClient(config.creds.api_key)
 
     def get_offers_by_requirements(
-        self, requirements: Requirements
+        self, requirements: Requirements, full_offers: bool = False
     ) -> List[InstanceOfferWithAvailability]:
         if _should_query_live_gpu_offers(requirements):
             offers = _get_live_gpu_offers(
