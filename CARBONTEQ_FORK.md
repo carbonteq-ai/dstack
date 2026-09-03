@@ -6,9 +6,10 @@ Published candidate branch. The working tree is based on upstream dstack
 `0.20.29` at commit `2f9618f4d521140350efd1b344412d122c1e0322`.
 `origin` points to `carbonteq-ai/dstack` and `upstream` points to
 `dstackai/dstack`. Consumers may pin only a published CarbonTeq commit by full
-SHA. Commit `ff60da0395f2b5832f99e50a8d1f4f6ebf3367c4` is the currently qualified
+SHA. Commit `85cab941fb4f8e243c7014c278ea01705f89651e` is the currently qualified
 server/runner/shim release; its merge migration, rolling worker gate, and
-graceful-cancellation canary passed in production.
+graceful-cancellation canary passed in production. A live read-only RunPod
+offer query also passed after deployment.
 
 Published branch `codex/registry-default-auth` adds the exact-host registry
 credential and live RunPod GPU-offer behavior below on top of commit
@@ -28,6 +29,13 @@ run-lifecycle Alembic branches with one no-op merge revision. This keeps both
 published migration histories intact while restoring a single `head` target.
 
 ## Maintained delta
+
+### Keep the RunPod offer adapter compatible with the core offer contract
+
+The core filtered-offer interface now passes a `full_offers` argument. The
+RunPod override accepts that argument even though its live-capacity result does
+not currently vary with the flag. Without this compatibility parameter every
+RunPod offer lookup raised `TypeError` before capacity admission.
 
 ### Apply server registry credentials to an explicit exact-match host
 
@@ -441,7 +449,4 @@ Server Edition. dstack observed submission through `done`, CUDA reported
 active Pods.
 
 Current deployed fork commit:
-`ae5dac6576b0f19b49e81b31781f3b9f14e95361`. Current candidate code merge:
-`98c75b7f6136fb40420e58a6f3eed476f6aaa088` on branch
-`codex/registry-default-auth`; the following ledger-only commit does not alter
-server, runner, or shim bytes.
+`85cab941fb4f8e243c7014c278ea01705f89651e`.
