@@ -486,7 +486,7 @@ class TestVolumeWorkerDeleted:
         assert len(events) == 1
         assert events[0].message == "Volume deleted"
 
-    async def test_marks_volume_deleted_if_backend_not_available(
+    async def test_retries_volume_deletion_if_backend_not_available(
         self, test_db, session: AsyncSession, worker: VolumeWorker
     ):
         project = await create_project(session=session)
@@ -511,13 +511,12 @@ class TestVolumeWorkerDeleted:
             get_backend_mock.assert_called_once()
 
         await session.refresh(volume)
-        assert volume.deleted is True
-        assert volume.deleted_at is not None
+        assert volume.deleted is False
+        assert volume.deleted_at is None
         events = await list_events(session)
-        assert len(events) == 1
-        assert events[0].message == "Volume deleted"
+        assert events == []
 
-    async def test_marks_volume_deleted_if_backend_delete_errors(
+    async def test_retries_volume_deletion_if_backend_delete_errors(
         self, test_db, session: AsyncSession, worker: VolumeWorker
     ):
         project = await create_project(session=session)
@@ -550,8 +549,7 @@ class TestVolumeWorkerDeleted:
             backend_mock.compute.return_value.delete_volume.assert_called_once()
 
         await session.refresh(volume)
-        assert volume.deleted is True
-        assert volume.deleted_at is not None
+        assert volume.deleted is False
+        assert volume.deleted_at is None
         events = await list_events(session)
-        assert len(events) == 1
-        assert events[0].message == "Volume deleted"
+        assert events == []

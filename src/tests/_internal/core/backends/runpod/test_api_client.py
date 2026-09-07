@@ -69,3 +69,75 @@ def test_create_cpu_pod_uses_deploy_cpu_pod(monkeypatch):
     assert response["id"] == "cpu-pod-1"
     assert "deployCpuPod" in query["value"]
     assert "podFindAndDeployOnDemand" not in query["value"]
+
+
+def test_get_data_center_gpu_availability(monkeypatch):
+    client = RunpodApiClient(api_key="test")
+    query = {}
+
+    def fake_make_request(data):
+        query["value"] = data["query"]
+        return _Response(
+            {
+                "data": {
+                    "dataCenters": [
+                        {
+                            "id": "US-MD-1",
+                            "gpuAvailability": [
+                                {"gpuTypeId": "NVIDIA A100 80GB PCIe", "stockStatus": "Medium"}
+                            ],
+                        },
+                        {"id": "EUR-IS-1", "gpuAvailability": []},
+                    ]
+                }
+            }
+        )
+
+    monkeypatch.setattr(client, "_make_request", fake_make_request)
+
+    assert client.get_data_center_gpu_availability() == {
+        "US-MD-1": {"NVIDIA A100 80GB PCIe": "Medium"},
+        "EUR-IS-1": {},
+    }
+    assert "gpuAvailability" in query["value"]
+    assert "gpuTypeId" in query["value"]
+
+
+def test_get_network_volumes_by_name(monkeypatch):
+    client = RunpodApiClient(api_key="test")
+
+    monkeypatch.setattr(
+        client,
+        "_make_request",
+        lambda _data: _Response(
+            {
+                "data": {
+                    "myself": {
+                        "networkVolumes": [
+                            {
+                                "id": "volume-1",
+                                "name": "expected",
+                                "size": 100,
+                                "dataCenter": {"id": "US-CA-2", "name": "US California"},
+                            },
+                            {
+                                "id": "volume-2",
+                                "name": "other",
+                                "size": 100,
+                                "dataCenter": {"id": "US-WA-1", "name": "US Washington"},
+                            },
+                        ]
+                    }
+                }
+            }
+        ),
+    )
+
+    assert client.get_network_volumes_by_name("expected") == [
+        {
+            "id": "volume-1",
+            "name": "expected",
+            "size": 100,
+            "dataCenter": {"id": "US-CA-2", "name": "US California"},
+        }
+    ]

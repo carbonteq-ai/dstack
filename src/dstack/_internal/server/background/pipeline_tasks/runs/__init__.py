@@ -29,7 +29,13 @@ from dstack._internal.server.background.pipeline_tasks.runs.common import (
     delete_superseded_no_capacity_job_submissions,
 )
 from dstack._internal.server.db import get_db, get_session_ctx
-from dstack._internal.server.models import InstanceModel, JobModel, ProjectModel, RunModel
+from dstack._internal.server.models import (
+    InstanceModel,
+    JobModel,
+    ProjectModel,
+    RunModel,
+    VolumeModel,
+)
 from dstack._internal.server.services import events
 from dstack._internal.server.services.gateways import get_combined_gateway_stats
 from dstack._internal.server.services.jobs import emit_job_status_change_event
@@ -272,6 +278,7 @@ class RunWorker(Worker[RunPipelineItem]):
         if item.status == RunStatus.TERMINATING:
             await _process_terminating_item(item)
             self._pipeline_hinter.hint_fetch(JobModel.__name__)
+            self._pipeline_hinter.hint_fetch(VolumeModel.__name__)
             return
 
         logger.error("Skipping run %s with unexpected status %s", item.id, item.status)
@@ -911,6 +918,26 @@ async def _apply_terminating_result(
             old_status=context.run_model.status,
             new_status=result.run_update_map.get("status", context.run_model.status),
         )
+        new_status = result.run_update_map.get("status")
+        if new_status in RunStatus.finished_statuses():
+            owned_volume = await session.scalar(
+                select(VolumeModel).where(
+                    VolumeModel.run_id == item.id,
+                    VolumeModel.deleted == False,
+                )
+            )
+            if owned_volume is not None and not owned_volume.to_be_deleted:
+                owned_volume.to_be_deleted = True
+                owned_volume.last_processed_at = now
+                events.emit(
+                    session,
+                    "Managed run storage scheduled for deletion",
+                    actor=events.SystemActor(),
+                    targets=[
+                        events.Target.from_model(owned_volume),
+                        events.Target.from_model(context.run_model),
+                    ],
+                )
         await session.commit()
 
 

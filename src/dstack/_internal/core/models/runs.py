@@ -42,6 +42,7 @@ from dstack._internal.core.models.profiles import (
     SpotPolicy,
     UtilizationPolicy,
 )
+from dstack._internal.core.models.provisioning_preconditions import ImageReadinessSnapshot
 from dstack._internal.core.models.repos import AnyRunRepoData
 from dstack._internal.core.models.resources import Memory, ResourcesSpec
 from dstack._internal.core.models.routers import RouterType
@@ -81,6 +82,14 @@ class JobStatus(str, Enum):
 class Retry(CoreModel):
     on_events: List[RetryEvent]
     duration: int
+    duration_by_event: Dict[RetryEvent, int] = Field(default_factory=dict)
+    max_attempts_by_event: Dict[RetryEvent, int] = Field(default_factory=dict)
+
+    def duration_for(self, event: RetryEvent) -> int:
+        return self.duration_by_event.get(event, self.duration)
+
+    def max_attempts_for(self, event: RetryEvent) -> Optional[int]:
+        return self.max_attempts_by_event.get(event)
 
     def pretty_format(self) -> str:
         pretty_duration = format_pretty_duration(self.duration)
@@ -336,6 +345,10 @@ class JobProvisioningData(CoreModel):
     ssh_proxy: Optional[SSHConnectionParams] = None
     backend_data: Optional[str] = None
     """`backend_data` stores backend-specific data in JSON."""
+    provisioning_timeout_seconds: Optional[int] = None
+    """Provider-selected runner readiness timeout persisted for restart-safe processing."""
+    provisioning_started_at: Optional[datetime] = None
+    """Provider resource creation time, excluding any pre-create readiness wait."""
 
     def get_base_backend(self) -> BackendType:
         if self.base_backend is not None:
@@ -427,6 +440,7 @@ class JobSubmission(CoreModel):
     error: Optional[str] = None
     probes: list[Probe] = []
     image_pull_progress: Optional[ImagePullProgress] = None
+    image_readiness: Optional[ImageReadinessSnapshot] = None
 
     @property
     def age(self) -> timedelta:

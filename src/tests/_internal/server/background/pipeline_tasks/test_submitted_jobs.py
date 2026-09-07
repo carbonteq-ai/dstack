@@ -4,11 +4,13 @@ from datetime import timedelta
 from typing import cast
 from unittest.mock import AsyncMock, Mock, call, patch
 
+import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
+from dstack._internal.core.backends.runpod.models import RunpodRunStorageConfig
 from dstack._internal.core.errors import BackendError
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.common import EntityReference, NetworkMode, RegistryAuth
@@ -24,11 +26,19 @@ from dstack._internal.core.models.profiles import (
     InstanceNameSelector,
     InstanceSelector,
     Profile,
+    SpotPolicy,
+)
+from dstack._internal.core.models.provisioning_preconditions import (
+    HTTPBearerCredentials,
+    ImageReadinessSnapshot,
+    ImageReadinessState,
+    ResolvedHTTPImageReadinessConfig,
 )
 from dstack._internal.core.models.resources import CPUSpec, Memory, Range, ResourcesSpec
 from dstack._internal.core.models.runs import JobRuntimeData, JobStatus, JobTerminationReason
 from dstack._internal.core.models.users import GlobalRole
 from dstack._internal.core.models.volumes import (
+    RunpodVolumeConfiguration,
     VolumeAttachmentData,
     VolumeMountPoint,
     VolumeStatus,
@@ -39,7 +49,10 @@ from dstack._internal.server.background.pipeline_tasks.jobs_submitted import (
     JobSubmittedPipeline,
     JobSubmittedPipelineItem,
     JobSubmittedWorker,
+    _can_rotate_run_storage,
+    _get_runpod_offer_stock_rank,
     _load_submitted_job_context,
+    _select_run_storage_region,
 )
 from dstack._internal.server.models import (
     ComputeGroupModel,
@@ -48,11 +61,14 @@ from dstack._internal.server.models import (
     JobModel,
     PlacementGroupModel,
     VolumeAttachmentModel,
+    VolumeModel,
 )
 from dstack._internal.server.services.docker import ImageConfig
 from dstack._internal.server.services.jobs.configurators.base import JobConfigurator
+from dstack._internal.server.services.runs import get_run_spec as get_persisted_run_spec
 from dstack._internal.server.testing.common import (
     ComputeMockSpec,
+    create_backend,
     create_export,
     create_fleet,
     create_instance,
@@ -367,6 +383,415 @@ class TestJobSubmittedFetcher:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
 class TestJobSubmittedWorker:
+    async def test_managed_storage_selects_lowest_price_in_backend_region_pool(
+        self, test_db, session: AsyncSession
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        await create_backend(
+            session=session,
+            project_id=project.id,
+            backend_type=BackendType.RUNPOD,
+            config={
+                "regions": ["US-CA-2", "US-KS-2"],
+                "run_storage": {"size": "10GB", "path": "/workspace"},
+            },
+            auth={"type": "api_key", "api_key": "test-api-key"},
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=get_run_spec(
+                repo_id=repo.name,
+                configuration=TaskConfiguration(image="debian", nodes=1),
+                profile=Profile(spot_policy=SpotPolicy.SPOT),
+            ),
+        )
+        job = await create_job(session=session, run=run)
+        context = await _load_submitted_job_context(session=session, job_model=job)
+        offers = [
+            (
+                Mock(),
+                get_instance_offer_with_availability(
+                    backend=BackendType.RUNPOD,
+                    region="US-KS-2",
+                    spot=True,
+                    price=1.39,
+                ),
+            ),
+            (
+                Mock(),
+                get_instance_offer_with_availability(
+                    backend=BackendType.RUNPOD,
+                    region="US-CA-2",
+                    spot=True,
+                    price=1.59,
+                ),
+            ),
+        ]
+
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+            new=AsyncMock(return_value=offers),
+        ):
+            region = await _select_run_storage_region(
+                context,
+                RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+
+        assert region == "US-KS-2"
+
+        offers[0][1].backend_data = {"stock_status": "Low"}
+        offers[1][1].backend_data = {"stock_status": "Medium"}
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+            new=AsyncMock(return_value=offers),
+        ):
+            stocked_region = await _select_run_storage_region(
+                context,
+                RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+        assert stocked_region == "US-CA-2"
+        assert _get_runpod_offer_stock_rank(offers[0][1]) == 1
+        assert _get_runpod_offer_stock_rank(offers[1][1]) == 2
+        offers[0][1].backend_data = {}
+        offers[1][1].backend_data = {}
+
+        now = get_current_datetime()
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.FAILED,
+            configuration=RunpodVolumeConfiguration(
+                name=f"run-{run.id.hex}",
+                region="US-KS-2",
+                size="10GB",
+                tags={"dstack-run-storage-failed-regions": f"us-ks-2:{int(now.timestamp())}"},
+            ),
+        )
+        volume.run_id = run.id
+        await session.commit()
+
+        with (
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+                new=AsyncMock(return_value=offers),
+            ),
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_current_datetime",
+                return_value=now + timedelta(minutes=9),
+            ),
+        ):
+            cooling_region = await _select_run_storage_region(
+                context,
+                RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+        assert cooling_region == "US-CA-2"
+
+        volume_configuration = RunpodVolumeConfiguration.parse_raw(volume.configuration)
+        assert volume_configuration.tags is not None
+        volume_configuration.tags["dstack-run-storage-failed-regions"] = (
+            f"us-ca-2:{int(now.timestamp())}+us-ks-2:{int(now.timestamp())}"
+        )
+        volume.configuration = volume_configuration.json()
+        await session.commit()
+        with (
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+                new=AsyncMock(return_value=offers),
+            ),
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_current_datetime",
+                return_value=now + timedelta(minutes=9),
+            ),
+        ):
+            no_region = await _select_run_storage_region(
+                context,
+                RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+        assert no_region is None
+
+        with (
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+                new=AsyncMock(return_value=offers),
+            ),
+            patch(
+                "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_current_datetime",
+                return_value=now + timedelta(minutes=10, seconds=1),
+            ),
+        ):
+            eligible_again = await _select_run_storage_region(
+                context,
+                RunpodRunStorageConfig(size="10GB", path="/workspace"),
+            )
+        assert eligible_again == "US-KS-2"
+
+    async def test_creates_one_managed_volume_for_runpod_spot_task(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        await create_backend(
+            session=session,
+            project_id=project.id,
+            backend_type=BackendType.RUNPOD,
+            config={
+                "run_storage": {
+                    "region": "US-WA-1",
+                    "size": "10GB",
+                    "path": "/workspace",
+                }
+            },
+            auth={"type": "api_key", "api_key": "test-api-key"},
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=get_run_spec(
+                repo_id=repo.name,
+                configuration=TaskConfiguration(image="debian", nodes=1),
+                profile=Profile(spot_policy=SpotPolicy.SPOT),
+            ),
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        volumes = list(
+            (await session.execute(select(VolumeModel).where(VolumeModel.run_id == run.id)))
+            .scalars()
+            .all()
+        )
+        assert len(volumes) == 1
+        assert volumes[0].status == VolumeStatus.SUBMITTED
+        assert volumes[0].name == f"run-{run.id.hex}"
+        await session.refresh(run)
+        run_spec = get_persisted_run_spec(run)
+        assert run_spec.configuration.volumes == [
+            VolumeMountPoint(name=volumes[0].name, path="/workspace")
+        ]
+
+        await _process_job(session=session, worker=worker, job_model=job)
+        volume_count = await session.scalar(
+            select(func.count()).select_from(VolumeModel).where(VolumeModel.run_id == run.id)
+        )
+        assert volume_count == 1
+
+    async def test_rotates_empty_managed_volume_after_no_capacity(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        await create_backend(
+            session=session,
+            project_id=project.id,
+            backend_type=BackendType.RUNPOD,
+            config={
+                "regions": ["US-KS-2", "US-CA-2"],
+                "run_storage": {"size": "10GB", "path": "/workspace"},
+            },
+            auth={"type": "api_key", "api_key": "test-api-key"},
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=get_run_spec(
+                repo_id=repo.name,
+                configuration=TaskConfiguration(image="debian", nodes=1),
+                profile=Profile(spot_policy=SpotPolicy.SPOT),
+            ),
+        )
+        await create_job(
+            session=session,
+            run=run,
+            submission_num=0,
+            status=JobStatus.FAILED,
+            termination_reason=JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY,
+        )
+        current_job = await create_job(session=session, run=run, submission_num=1)
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.ACTIVE,
+            configuration=RunpodVolumeConfiguration(
+                name=f"run-{run.id.hex}",
+                region="US-KS-2",
+                size="10GB",
+                auto_cleanup_duration="off",
+                tags={"dstack-run-id": str(run.id)},
+            ),
+        )
+        volume.run_id = run.id
+        run_spec = get_persisted_run_spec(run)
+        run_spec.configuration.volumes = [VolumeMountPoint(name=volume.name, path="/workspace")]
+        run.run_spec = run_spec.json()
+        await session.commit()
+
+        await _process_job(session=session, worker=worker, job_model=current_job)
+
+        await session.refresh(volume)
+        assert volume.to_be_deleted
+        failed_configuration = RunpodVolumeConfiguration.parse_raw(volume.configuration)
+        assert failed_configuration.tags is not None
+        assert failed_configuration.tags["dstack-run-id"] == str(run.id)
+        assert failed_configuration.tags["dstack-run-storage-failed-regions"].startswith(
+            "us-ks-2:"
+        )
+
+        volume.deleted = True
+        await session.commit()
+        offers = [
+            (
+                Mock(),
+                get_instance_offer_with_availability(
+                    backend=BackendType.RUNPOD,
+                    region="US-KS-2",
+                    spot=True,
+                    price=1.39,
+                ),
+            ),
+            (
+                Mock(),
+                get_instance_offer_with_availability(
+                    backend=BackendType.RUNPOD,
+                    region="US-CA-2",
+                    spot=True,
+                    price=1.59,
+                ),
+            ),
+        ]
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_offers_by_requirements",
+            new=AsyncMock(return_value=offers),
+        ):
+            await _process_job(session=session, worker=worker, job_model=current_job)
+
+        await session.refresh(volume)
+        assert not volume.deleted
+        assert not volume.to_be_deleted
+        assert volume.status == VolumeStatus.SUBMITTED
+        rotated_configuration = RunpodVolumeConfiguration.parse_raw(volume.configuration)
+        assert rotated_configuration.region == "US-CA-2"
+        assert rotated_configuration.tags is not None
+        assert rotated_configuration.tags["dstack-run-id"] == str(run.id)
+        assert rotated_configuration.tags["dstack-run-storage-failed-regions"].startswith(
+            "us-ks-2:"
+        )
+        volume.status = VolumeStatus.ACTIVE
+        await session.commit()
+        await _process_job(session=session, worker=worker, job_model=current_job)
+        await session.refresh(volume)
+        assert not volume.to_be_deleted
+        volume_count = await session.scalar(
+            select(func.count()).select_from(VolumeModel).where(VolumeModel.run_id == run.id)
+        )
+        assert volume_count == 1
+
+    async def test_rotates_failed_managed_volume_before_first_provisioning(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        await create_backend(
+            session=session,
+            project_id=project.id,
+            backend_type=BackendType.RUNPOD,
+            config={
+                "regions": ["US-CA-2", "US-MO-2"],
+                "run_storage": {"size": "10GB", "path": "/workspace"},
+            },
+            auth={"type": "api_key", "api_key": "test-api-key"},
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=get_run_spec(
+                repo_id=repo.name,
+                configuration=TaskConfiguration(image="debian", nodes=1),
+                profile=Profile(spot_policy=SpotPolicy.SPOT),
+            ),
+        )
+        current_job = await create_job(session=session, run=run)
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.FAILED,
+            configuration=RunpodVolumeConfiguration(
+                name=f"run-{run.id.hex}",
+                region="US-CA-2",
+                size="10GB",
+                auto_cleanup_duration="off",
+                tags={"dstack-run-id": str(run.id)},
+            ),
+        )
+        volume.run_id = run.id
+        await session.commit()
+
+        await _process_job(session=session, worker=worker, job_model=current_job)
+
+        await session.refresh(volume)
+        assert volume.to_be_deleted
+        failed_configuration = RunpodVolumeConfiguration.parse_raw(volume.configuration)
+        assert failed_configuration.tags is not None
+        assert failed_configuration.tags["dstack-run-id"] == str(run.id)
+        assert failed_configuration.tags["dstack-run-storage-failed-regions"].startswith(
+            "us-ca-2:"
+        )
+
+    async def test_does_not_rotate_managed_volume_after_first_provisioning(
+        self, test_db, session: AsyncSession
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.FAILED,
+            termination_reason=JobTerminationReason.INTERRUPTED_BY_NO_CAPACITY,
+            job_provisioning_data=get_job_provisioning_data(
+                backend=BackendType.RUNPOD,
+                region="US-KS-2",
+            ),
+        )
+        current_job = await create_job(session=session, run=run, submission_num=1)
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.ACTIVE,
+            configuration=RunpodVolumeConfiguration(
+                name=f"run-{run.id.hex}",
+                region="US-KS-2",
+                size="10GB",
+            ),
+        )
+        volume.run_id = run.id
+        await session.commit()
+        context = await _load_submitted_job_context(
+            session=session,
+            job_model=current_job,
+        )
+
+        assert not await _can_rotate_run_storage(context, volume)
+
     async def test_provisions_assigned_job_on_existing_instance(
         self, test_db, session: AsyncSession, worker: JobSubmittedWorker
     ):
@@ -451,6 +876,91 @@ class TestJobSubmittedWorker:
             )
         )
         assert len(res.scalars().all()) == 1
+
+    async def test_waits_for_verified_image_before_new_capacity_provider_call(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=1)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        digest = "sha256:" + "a" * 64
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                image=f"registry.example/carbonteq/job@{digest}",
+                commands=["true"],
+            ),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        job = await create_job(session=session, run=run)
+        offer = get_instance_offer_with_availability(backend=BackendType.RUNPOD)
+
+        backend_mock = Mock()
+        backend_mock.TYPE = BackendType.RUNPOD
+        backend_mock.get_image_readiness_precondition.return_value = (
+            ResolvedHTTPImageReadinessConfig(
+                url="http://controller.local/v1/publications",
+                timeout_seconds=60,
+                credentials=HTTPBearerCredentials(bearer_token="secret"),
+            )
+        )
+        compute_mock = Mock(spec=ComputeMockSpec)
+        backend_mock.compute.return_value = compute_mock
+        compute_mock.get_offers.return_value = [offer]
+        compute_mock.run_job.return_value = get_job_provisioning_data(
+            dockerized=True,
+            backend=BackendType.RUNPOD,
+        )
+
+        def response(state: str) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", "http://controller.local"),
+                json={"state": state},
+            )
+
+        with (
+            patch(
+                "dstack._internal.server.services.backends.get_project_backends",
+                return_value=[backend_mock],
+            ),
+            patch(
+                "httpx.AsyncClient.get",
+                new_callable=AsyncMock,
+                side_effect=[response("copying"), response("verified")],
+            ),
+        ):
+            await _process_job(session=session, worker=worker, job_model=job)
+            job = await _get_job(session, job.id)
+            assert job.instance_assigned
+
+            await _process_job(session=session, worker=worker, job_model=job)
+            job = await _get_job(session, job.id)
+            assert job.status == JobStatus.SUBMITTED
+            assert job.image_readiness is not None
+            waiting = ImageReadinessSnapshot.parse_raw(job.image_readiness)
+            assert waiting.state == ImageReadinessState.WAITING
+            compute_mock.run_job.assert_not_called()
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.PROVISIONING
+        assert job.image_readiness is not None
+        ready = ImageReadinessSnapshot.parse_raw(job.image_readiness)
+        assert ready.state == ImageReadinessState.READY
+        assert ready.started_at == waiting.started_at
+        compute_mock.run_job.assert_called_once()
 
     async def test_multinode_master_reuses_placeholder_when_provisioning_falls_back_to_run_job(
         self, test_db, session: AsyncSession, worker: JobSubmittedWorker

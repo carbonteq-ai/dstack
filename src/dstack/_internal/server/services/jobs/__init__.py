@@ -18,6 +18,7 @@ from dstack._internal.core.errors import (
 )
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.configurations import RunConfigurationType
+from dstack._internal.core.models.provisioning_preconditions import ImageReadinessSnapshot
 from dstack._internal.core.models.runs import (
     ImagePullProgress,
     Job,
@@ -276,6 +277,7 @@ def job_model_to_job_submission(
         error=error,
         probes=probes,
         image_pull_progress=_get_image_pull_progress(job_model),
+        image_readiness=_get_image_readiness(job_model),
     )
 
 
@@ -295,6 +297,12 @@ def _get_image_pull_progress(job_model: JobModel) -> Optional[ImagePullProgress]
     if job_model.image_pull_progress is None:
         return None
     return ImagePullProgress.__response__.parse_raw(job_model.image_pull_progress)
+
+
+def _get_image_readiness(job_model: JobModel) -> Optional[ImageReadinessSnapshot]:
+    if job_model.image_readiness is None:
+        return None
+    return ImageReadinessSnapshot.__response__.parse_raw(job_model.image_readiness)
 
 
 def get_job_spec(job_model: JobModel) -> JobSpec:

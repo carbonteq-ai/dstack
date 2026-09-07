@@ -15,6 +15,7 @@ from dstack._internal.core.models.runs import (
     RunStatus,
 )
 from dstack._internal.server.background.pipeline_tasks.runs import RunWorker
+from dstack._internal.server.background.pipeline_tasks.runs.pending import _get_retry_delay
 from dstack._internal.server.models import JobModel
 from dstack._internal.server.testing.common import (
     create_job,
@@ -167,6 +168,7 @@ class TestRunPendingWorker:
             user=user,
             status=RunStatus.PENDING,
             resubmission_attempt=4,
+            retry_state='{"no-capacity":{"attempts":4,"first_at":"2023-01-02T03:04:00+00:00"}}',
         )
         old_time = get_current_datetime() - timedelta(minutes=10)
         superseded_job = await create_job(
@@ -218,6 +220,9 @@ class TestRunPendingWorker:
         assert provisioned_job.id in [j.id for j in jobs]
         assert other_reason_job.id in [j.id for j in jobs]
         assert predecessor_job.id in [j.id for j in jobs]
+        assert json.loads(run.retry_state) == {
+            "no-capacity": {"attempts": 4, "first_at": "2023-01-02T03:04:00+00:00"}
+        }
         assert jobs[-1].status == JobStatus.SUBMITTED
 
     async def test_noops_when_run_lock_changes_after_processing(
@@ -362,3 +367,13 @@ class TestRunPendingWorker:
         res = await session.execute(select(JobModel).where(JobModel.run_id == run.id))
         jobs = list(res.scalars().all())
         assert len(jobs) == 0
+
+
+def test_retry_backoff_has_stable_twenty_percent_jitter_and_ten_minute_base_cap() -> None:
+    run_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    delays = [_get_retry_delay(attempt, run_id) for attempt in range(1, 9)]
+
+    bases = [15, 30, 60, 120, 300, 600, 600, 600]
+    for delay, base in zip(delays, bases):
+        assert timedelta(seconds=base * 0.8) <= delay <= timedelta(seconds=base * 1.2)
+    assert delays == [_get_retry_delay(attempt, run_id) for attempt in range(1, 9)]

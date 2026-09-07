@@ -53,7 +53,10 @@ from dstack._internal.server.background.pipeline_tasks.base import (
     set_processed_update_map_fields,
     set_unlock_update_map_fields,
 )
-from dstack._internal.server.background.pipeline_tasks.common import get_provisioning_timeout
+from dstack._internal.server.background.pipeline_tasks.common import (
+    get_provisioning_age,
+    get_provisioning_timeout,
+)
 from dstack._internal.server.db import get_db, get_session_ctx
 from dstack._internal.server.models import (
     ExportedFleetModel,
@@ -68,6 +71,7 @@ from dstack._internal.server.models import (
     UserModel,
 )
 from dstack._internal.server.schemas.runner import TaskStatus
+from dstack._internal.server.services import backends as backends_services
 from dstack._internal.server.services import events
 from dstack._internal.server.services import files as files_services
 from dstack._internal.server.services import logs as logs_services
@@ -833,15 +837,21 @@ async def _process_provisioning_status(
     provisioning_timeout = get_provisioning_timeout(
         backend_type=job_provisioning_data.get_base_backend(),
         instance_type_name=job_provisioning_data.instance_type.name,
+        configured_seconds=job_provisioning_data.provisioning_timeout_seconds,
     )
-    if context.job_submission.age > provisioning_timeout:
+    provisioning_age = get_provisioning_age(
+        submitted_at=context.job_submission.submitted_at,
+        provisioning_started_at=job_provisioning_data.provisioning_started_at,
+        now=get_current_datetime(),
+    )
+    if provisioning_age > provisioning_timeout:
         _terminate_job(
             job_model=context.job_model,
             job_update_map=result.job_update_map,
             termination_reason=JobTerminationReason.WAITING_RUNNER_LIMIT_EXCEEDED,
             termination_reason_message=(
                 f"Runner did not become available within {provisioning_timeout.total_seconds()}s."
-                f" Job submission age: {context.job_submission.age.total_seconds()}s)"
+                f" Provisioning age: {provisioning_age.total_seconds()}s)"
             ),
         )
 
@@ -945,7 +955,7 @@ async def _process_pulling_status(
                 return
 
     # SSH tunnel failed or READY but runner submit failed — treat as disconnect
-    _handle_instance_unreachable(context, result, job_provisioning_data)
+    await _handle_instance_unreachable(context, result, job_provisioning_data)
 
 
 async def _process_running_status(
@@ -973,7 +983,7 @@ async def _process_running_status(
         _reset_disconnected_at(context.job_model, result)
         return
 
-    _handle_instance_unreachable(context, result, job_provisioning_data)
+    await _handle_instance_unreachable(context, result, job_provisioning_data)
 
 
 async def _ensure_job_server_connection(
@@ -1118,11 +1128,19 @@ def _wait_for_instance_provisioning_data(
     result.job_update_map["job_provisioning_data"] = job_model.instance.job_provisioning_data
 
 
-def _handle_instance_unreachable(
+async def _handle_instance_unreachable(
     context: _ProcessContext,
     result: _ProcessResult,
     job_provisioning_data: JobProvisioningData,
 ) -> None:
+    if await _provider_confirms_spot_instance_absent(context, job_provisioning_data):
+        _terminate_job(
+            job_model=context.job_model,
+            job_update_map=result.job_update_map,
+            termination_reason=JobTerminationReason.INTERRUPTED_BY_NO_CAPACITY,
+            termination_reason_message="Provider reports the spot instance is absent",
+        )
+        return
     _set_disconnected_at_now(context.job_model, result)
     if not _should_terminate_job_due_to_disconnect(
         _get_result_disconnected_at(context.job_model, result)
@@ -1143,6 +1161,43 @@ def _handle_instance_unreachable(
         termination_reason=termination_reason,
         termination_reason_message="Instance is unreachable",
     )
+
+
+async def _provider_confirms_spot_instance_absent(
+    context: _ProcessContext,
+    job_provisioning_data: JobProvisioningData,
+) -> bool:
+    if not job_provisioning_data.instance_type.resources.spot:
+        return False
+    async with get_session_ctx() as session:
+        project = await session.scalar(
+            select(ProjectModel)
+            .where(ProjectModel.id == context.project.id)
+            .options(joinedload(ProjectModel.backends))
+        )
+        if project is None:
+            return False
+        backend = await backends_services.get_project_backend_by_type(
+            project=project,
+            backend_type=job_provisioning_data.get_base_backend(),
+        )
+    if backend is None:
+        return False
+    try:
+        present = await run_async(
+            backend.compute().is_instance_present,
+            instance_id=job_provisioning_data.instance_id,
+            region=job_provisioning_data.region,
+            backend_data=job_provisioning_data.backend_data,
+        )
+    except Exception:
+        logger.warning(
+            "%s: failed to observe spot instance through provider; using reachability fallback",
+            fmt(context.job_model),
+            exc_info=True,
+        )
+        return False
+    return present is False
 
 
 def _initialize_running_job_probes(

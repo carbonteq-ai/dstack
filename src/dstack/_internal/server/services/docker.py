@@ -100,10 +100,12 @@ def apply_server_docker_defaults(
     image_name: str,
     registry_auth: Optional[RegistryAuth],
 ) -> tuple[str, Optional[RegistryAuth]]:
-    if parse_image_name(image_name).registry is not None:
-        return image_name, registry_auth
-    if server_settings.SERVER_DEFAULT_DOCKER_REGISTRY is not None:
+    image_registry = parse_image_name(image_name).registry
+    default_registry = server_settings.SERVER_DEFAULT_DOCKER_REGISTRY
+    if image_registry is None and default_registry is not None:
         image_name = f"{server_settings.SERVER_DEFAULT_DOCKER_REGISTRY}/{image_name}"
+    elif image_registry is not None and image_registry != default_registry:
+        return image_name, registry_auth
     if (
         registry_auth is None
         and server_settings.SERVER_DEFAULT_DOCKER_REGISTRY_USERNAME is not None

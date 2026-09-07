@@ -16,6 +16,7 @@ from dstack._internal.core.models.runs import (
     RunStatus,
     RunTerminationReason,
 )
+from dstack._internal.core.models.volumes import VolumeStatus
 from dstack._internal.server.background.pipeline_tasks.jobs_terminating import (
     JobTerminatingPipeline,
 )
@@ -32,6 +33,7 @@ from dstack._internal.server.testing.common import (
     create_repo,
     create_run,
     create_user,
+    create_volume,
     get_job_provisioning_data,
     get_run_spec,
 )
@@ -176,6 +178,13 @@ class TestRunTerminatingWorker:
             status=JobStatus.FAILED,
             termination_reason=JobTerminationReason.EXECUTOR_ERROR,
         )
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.ACTIVE,
+        )
+        volume.run_id = run.id
         lock_run(run)
         await session.commit()
 
@@ -186,6 +195,8 @@ class TestRunTerminatingWorker:
         assert run.lock_token is None
         assert run.lock_expires_at is None
         assert run.lock_owner is None
+        await session.refresh(volume)
+        assert volume.to_be_deleted
 
     @freeze_time(datetime(2023, 1, 2, 3, 10, tzinfo=timezone.utc))
     async def test_reschedules_scheduled_run_and_clears_fleet(

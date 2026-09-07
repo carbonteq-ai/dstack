@@ -18,6 +18,8 @@ def get_retry(profile: Profile) -> Optional[Retry]:
             return Retry(
                 on_events=[RetryEvent.NO_CAPACITY, RetryEvent.INTERRUPTION, RetryEvent.ERROR],
                 duration=DEFAULT_RETRY_DURATION,
+                duration_by_event={},
+                max_attempts_by_event={},
             )
         return None
     profile_retry = profile_retry.copy()
