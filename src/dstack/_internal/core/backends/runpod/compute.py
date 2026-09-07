@@ -218,26 +218,31 @@ class RunpodCompute(
                 data_center_id = None
                 country_code = instance_offer.region
 
-            resp = self.api_client.create_pod(
-                name=pod_name,
-                image_name=job.job_spec.image_name,
-                container_registry_auth_id=container_registry_auth_id,
-                gpu_type_id=instance_offer.instance.name,
-                cloud_type=cloud_type,
-                data_center_id=data_center_id,
-                country_code=country_code,
-                gpu_count=gpu_count,
-                container_disk_in_gb=disk_size,
-                min_vcpu_count=instance_offer.instance.resources.cpus,
-                min_memory_in_gb=memory_size,
-                support_public_ip=True,
-                docker_args=_get_docker_args(authorized_keys),
-                ports=f"{DSTACK_RUNNER_SSH_PORT}/tcp",
-                bid_per_gpu=bid_per_gpu,
-                network_volume_id=network_volume_id,
-                volume_mount_path=volume_mount_path,
-                env={"RUNPOD_POD_USER": "0"},
-            )
+            try:
+                resp = self.api_client.create_pod(
+                    name=pod_name,
+                    image_name=job.job_spec.image_name,
+                    container_registry_auth_id=container_registry_auth_id,
+                    gpu_type_id=instance_offer.instance.name,
+                    cloud_type=cloud_type,
+                    data_center_id=data_center_id,
+                    country_code=country_code,
+                    gpu_count=gpu_count,
+                    container_disk_in_gb=disk_size,
+                    min_vcpu_count=instance_offer.instance.resources.cpus,
+                    min_memory_in_gb=memory_size,
+                    support_public_ip=True,
+                    docker_args=_get_docker_args(authorized_keys),
+                    ports=f"{DSTACK_RUNNER_SSH_PORT}/tcp",
+                    bid_per_gpu=bid_per_gpu,
+                    network_volume_id=network_volume_id,
+                    volume_mount_path=volume_mount_path,
+                    env={"RUNPOD_POD_USER": "0"},
+                )
+            except RunpodApiClientError as e:
+                if _is_capacity_rejection(e):
+                    self.invalidate_offers_cache()
+                raise
 
         instance_id = resp["id"]
 
@@ -605,10 +610,19 @@ def _should_query_live_gpu_offers(requirements: Requirements) -> bool:
     gpu = requirements.resources.gpu
     return (
         not requirements.multinode
-        and requirements.spot is not False
         and gpu is not None
         and (gpu.count.min or 0) > 0
     )
+
+
+def _is_capacity_rejection(error: RunpodApiClientError) -> bool:
+    for item in error.errors:
+        extensions = item.get("extensions")
+        code = extensions.get("code") if isinstance(extensions, dict) else None
+        message = str(item.get("message", "")).lower()
+        if code == "SUPPLY_CONSTRAINT" or "no longer any instances available" in message:
+            return True
+    return False
 
 
 def _get_runpod_volume_name(volume: Volume, region: str) -> str:

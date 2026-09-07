@@ -309,6 +309,11 @@ class ComputeWithFilteredOffersCached(ABC):
     ) -> Iterator[InstanceOfferWithAvailability]:
         return iter(self._get_offers_cached(requirements, full_offers))
 
+    def invalidate_offers_cache(self) -> None:
+        """Discard provider offers after an authoritative launch rejection."""
+        with self._offers_cache_lock:
+            self._offers_cache.clear()
+
     def _get_offers_cached_key(self, requirements: Requirements, full_offers: bool) -> int:
         # Requirements is not hashable, so we use a hack to get arguments hash
         hashable_requirements = requirements.json()

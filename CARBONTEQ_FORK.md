@@ -29,6 +29,28 @@ published migration histories intact while restoring a single `head` target.
 
 ## Maintained delta
 
+### Resolve on-demand RunPod GPU offers from live capacity
+
+Single-node on-demand GPU requests use the same bounded live RunPod discovery
+path as spot requests. The previous fork implementation retained the offline
+gpuhunt catalog for on-demand GPUs and then marked every matching catalog row
+available. That made planning and fleet placeholder admission claim A100
+capacity even when RunPod's authoritative Pod mutation rejected every
+configured data center with `SUPPLY_CONSTRAINT`.
+
+CPU and multinode/cluster planning retain their existing catalog paths. The
+requested spot policy filters live single-node GPU results to spot, on-demand,
+or either. A provider capacity rejection also invalidates the bounded offer
+cache immediately, so the next retry refreshes discovery rather than replaying
+the same stale offer for the remainder of the cache TTL.
+
+Regression coverage in
+`src/tests/_internal/core/backends/runpod/test_compute.py` proves that
+on-demand GPU discovery uses live capacity, rejects an empty live result, and
+can invalidate and refresh the filtered-offer cache. Capacity-error recognition
+covers both RunPod's structured `SUPPLY_CONSTRAINT` code and its legacy
+"no longer any instances" message.
+
 ### Apply server registry credentials to an explicit exact-match host
 
 Posttrain submits a fully qualified, digest-pinned canonical image. Upstream's
@@ -48,7 +70,7 @@ Regression coverage in
 port mismatch, malicious prefix/suffix mismatch, explicit-auth precedence,
 incomplete server credentials, and the existing unqualified-image cases.
 
-### Resolve RunPod GPU spot offers from live capacity
+### Resolve RunPod GPU offers from live capacity
 
 The gpuhunt offline RunPod catalog is still useful for normalized hardware,
 CPU and cluster shapes, and on-demand baseline pricing, but its current
@@ -57,19 +79,20 @@ also cannot represent RunPod's volatile stock. This prevented dstack from
 planning an interruptible RunPod Pod even when RunPod's live GraphQL API
 reported capacity and a current spot price.
 
-The candidate delta keeps the offline catalog for on-demand, CPU, and cluster
-planning. A non-multinode GPU request that permits spot now queries RunPod's
-live provider for only the requested GPU count and allowed locations, filters
-Community Cloud unless configured, and converts the currently stocked rows
-through dstack's existing requirement and offer normalization. The final Pod
-creation mutation remains the authoritative capacity check because capacity
-can disappear after discovery; normal dstack retry behavior handles that race.
+The candidate delta keeps the offline catalog for CPU and cluster planning. A
+non-multinode GPU request queries RunPod's live provider for only the requested
+GPU count and allowed locations, filters Community Cloud unless configured,
+and converts the currently stocked rows through dstack's existing requirement
+and offer normalization. The final Pod creation mutation remains the
+authoritative capacity check because capacity can disappear after discovery;
+capacity rejection clears cached discovery before normal retry behavior.
 
 Regression coverage in
 `src/tests/_internal/core/backends/runpod/test_compute.py` verifies bounded
-Secure Cloud discovery, live spot conversion, and preservation of the offline
-on-demand path. A live read-only check returned current RTX PRO 6000 and A100
-80 GB Secure Cloud spot rows in approximately six seconds.
+Secure Cloud discovery, live spot and on-demand conversion, empty-capacity
+rejection, and offer-cache invalidation. A live read-only check returned
+current RTX PRO 6000 and A100 80 GB Secure Cloud rows in approximately six
+seconds.
 
 Infrastructure may additionally set `minimum_stock_status` to `low`, `medium`,
 or `high`. The upstream-compatible default remains `low`; CarbonTeq production

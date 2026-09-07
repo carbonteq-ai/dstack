@@ -6,10 +6,12 @@ import pytest
 import requests
 from gpuhunt.providers.runpod import RunpodProvider
 
+from dstack._internal.core.backends.runpod.api_client import RunpodApiClientError
 from dstack._internal.core.backends.runpod.compute import (
     RunpodCompute,
     RunpodOfferBackendData,
     _get_runpod_volume_name,
+    _is_capacity_rejection,
     _RunpodLiveGPUProvider,
 )
 from dstack._internal.core.backends.runpod.models import (
@@ -199,21 +201,90 @@ def test_spot_gpu_offers_respect_backend_minimum_stock_status():
         assert compute.get_offers_by_requirements(requirements) == []
 
 
-def test_on_demand_offers_keep_using_offline_catalog():
+def test_on_demand_gpu_offers_come_from_live_runpod_capacity():
+    raw_offer = gpuhunt.RawCatalogItem(
+        instance_name="NVIDIA A100-SXM4-80GB",
+        location="EUR-IS-1",
+        price=1.59,
+        cpu=32,
+        memory=125,
+        gpu_vendor="nvidia",
+        gpu_count=1,
+        gpu_name="A100",
+        gpu_memory=80,
+        spot=False,
+        disk_size=None,
+    )
     compute = RunpodCompute(RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret")))
     requirements = Requirements(resources=ResourcesSpec(gpu="A100:1"), spot=False)
 
     with (
-        patch(
-            "dstack._internal.core.backends.runpod.compute.get_catalog_offers",
-            return_value=[],
-        ) as get_catalog_offers,
-        patch.object(_RunpodLiveGPUProvider, "get") as get_live_offers,
+        patch.object(RunpodProvider, "__init__", return_value=None),
+        patch.object(_RunpodLiveGPUProvider, "get", return_value=[raw_offer]) as get_live_offers,
+        patch.object(
+            compute.api_client,
+            "get_data_center_gpu_availability",
+            return_value={"EUR-IS-1": {"NVIDIA A100-SXM4-80GB": "Medium"}},
+        ),
+    ):
+        offers = compute.get_offers_by_requirements(requirements)
+
+    get_live_offers.assert_called_once()
+    assert len(offers) == 1
+    assert offers[0].region == "EUR-IS-1"
+    assert offers[0].instance.resources.spot is False
+
+
+def test_on_demand_gpu_offers_reject_missing_live_capacity():
+    compute = RunpodCompute(RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret")))
+    requirements = Requirements(resources=ResourcesSpec(gpu="A100:1"), spot=False)
+
+    with (
+        patch.object(RunpodProvider, "__init__", return_value=None),
+        patch.object(_RunpodLiveGPUProvider, "get", return_value=[]),
+        patch.object(
+            compute.api_client,
+            "get_data_center_gpu_availability",
+            return_value={},
+        ),
     ):
         assert compute.get_offers_by_requirements(requirements) == []
 
-    get_catalog_offers.assert_called_once()
-    get_live_offers.assert_not_called()
+
+def test_filtered_offer_cache_can_be_invalidated_after_capacity_rejection():
+    compute = RunpodCompute(RunpodConfig(creds=RunpodAPIKeyCreds(api_key="secret")))
+    requirements = Requirements(resources=ResourcesSpec(gpu="A100:1"), spot=False)
+
+    with (
+        patch.object(RunpodProvider, "__init__", return_value=None),
+        patch.object(_RunpodLiveGPUProvider, "get", return_value=[]) as get_live_offers,
+        patch.object(
+            compute.api_client,
+            "get_data_center_gpu_availability",
+            return_value={},
+        ),
+    ):
+        assert list(compute.get_offers(requirements, full_offers=False)) == []
+        assert list(compute.get_offers(requirements, full_offers=False)) == []
+        compute.invalidate_offers_cache()
+        assert list(compute.get_offers(requirements, full_offers=False)) == []
+
+    assert get_live_offers.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RunpodApiClientError(
+            [{"message": "unavailable", "extensions": {"code": "SUPPLY_CONSTRAINT"}}]
+        ),
+        RunpodApiClientError(
+            [{"message": "There are no longer any instances available with the request specifications."}]
+        ),
+    ],
+)
+def test_runpod_capacity_rejections_are_recognized(error):
+    assert _is_capacity_rejection(error)
 
 
 @pytest.mark.parametrize(("pod", "expected"), [({"id": "pod-1"}, True), (None, False)])
