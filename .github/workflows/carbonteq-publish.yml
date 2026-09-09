@@ -1,0 +1,152 @@
+# Publish the CarbonTeq server and binaries images to GHCR.
+#
+# WHY THIS EXISTS. The control plane has two consumers of a dstack server — the
+# Dokploy deployment and `app/compose.yaml`, which is what CI and the contract
+# tests boot. While one built from source and the other pulled a published
+# image, a fork bump had to move four pins together and the two could silently
+# disagree about what "this commit" means. One image, built once here, pulled by
+# both, addressed by digest, removes that.
+#
+# GHCR rather than Docker Hub: public packages are free, the namespace is the
+# ORGANISATION's rather than a personal account (the bus factor recorded as
+# ADR-033 in the consumer repository), and `GITHUB_TOKEN` publishes with no
+# secret to manage. This repository is public, so Actions minutes are free here.
+#
+# THE PACKAGE MUST BE PUBLIC. A package published by GITHUB_TOKEN starts private,
+# and a private package means the deploy host needs a registry credential — the
+# thing this arrangement exists to avoid. Set it once, after the first run:
+# Organisation → Packages → dstack-carbonteq → Package settings → Change
+# visibility → Public. Verify with a credential-free pull:
+#
+#   docker logout ghcr.io
+#   docker pull ghcr.io/carbonteq-ai/dstack-carbonteq:<tag>
+#
+# THE VERSION IS NOT AN INPUT. `version.sh` derives it from the commit being
+# built, so the tag cannot name a build it did not come from. Both images run
+# that same script over that same context, which is what makes the server and
+# the runner/shim agree — a disagreement there is the mixed rollout
+# CARBONTEQ_FORK.md calls unsafe, and it fails silently: the server tells a
+# worker to install a version the binaries host does not serve, the download
+# 404s, and the worker keeps the binaries it already had.
+name: Publish CarbonTeq images
+
+on:
+  push:
+    branches: [dstack-cp-mvp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # Not cancel-in-progress: a half-published pair is the mixed rollout above.
+  group: carbonteq-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/carbonteq-ai/dstack-carbonteq
+
+jobs:
+  publish:
+    # Never from a fork of this fork: it would publish into a namespace the
+    # consumer repository pins by digest.
+    if: github.repository == 'carbonteq-ai/dstack'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # A real .git directory is required, not a tarball: both Dockerfiles
+        # `COPY .git .git` and resolve the version from the ref metadata inside
+        # the build context.
+        uses: actions/checkout@v4
+
+      - name: Derive the release version from the commit
+        id: version
+        run: |
+          set -eu
+          V=$(sh docker/server/carbonteq/version.sh)
+          case "$V" in
+            *+carbonteq.g*) ;;
+            *) echo "version.sh produced '$V', which is not a carbonteq build" >&2; exit 1 ;;
+          esac
+          echo "version=$V"        >> "$GITHUB_OUTPUT"
+          echo "tag=${V/+/-}"      >> "$GITHUB_OUTPUT"   # a Docker tag cannot contain +
+          echo "Building $V"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the server image
+        id: server
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/server/carbonteq/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.tag }}
+          # Both are load-bearing: the Dockerfile stamps
+          # org.opencontainers.image.revision/.version from them and
+          # SOURCE_COMMIT has no fallback, so omitting them ships an image whose
+          # labels cannot say which commit produced it.
+          build-args: |
+            RELEASE_VERSION=${{ steps.version.outputs.version }}
+            SOURCE_COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,scope=server,mode=max
+
+      - name: Build and push the binaries image
+        id: binaries
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/server/carbonteq/Dockerfile.binaries
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.tag }}-binaries
+          # No VERSION: it falls back to version.sh over the same context, which
+          # is what makes the two images agree without being told twice.
+          cache-from: type=gha,scope=binaries
+          cache-to: type=gha,scope=binaries,mode=max
+
+      - name: Verify both images carry the version they were built from
+        run: |
+          set -eu
+          V='${{ steps.version.outputs.version }}'
+          T='${{ steps.version.outputs.tag }}'
+          # The server reports the version baked into its wheel...
+          baked=$(docker run --rm --entrypoint /root/.local/share/uv/tools/dstack/bin/python \
+            "$IMAGE:$T" -c 'import dstack.version as v; print(v.__version__)')
+          # ...and the binaries image serves exactly that path, or every worker
+          # download 404s and the fleet silently keeps its old binaries.
+          # Asked as "is the exact path there", not "what is the first entry" —
+          # the directory sits alongside nginx's own index.html and 50x.html.
+          served=$(docker run --rm --entrypoint sh "$IMAGE:$T-binaries" -c \
+            "test -f '/usr/share/nginx/html/$V/binaries/dstack-runner-linux-amd64' && echo present || true")
+          echo "server baked:    $baked"
+          echo "binaries serve $V: ${served:-ABSENT}"
+          test "$baked"  = "$V"       || { echo "server image reports '$baked', expected '$V'" >&2; exit 1; }
+          test "$served" = "present"  || { echo "binaries image does not serve $V — every worker download would 404" >&2; exit 1; }
+
+      - name: Record the pins
+        run: |
+          {
+            echo "## Published \`${{ steps.version.outputs.version }}\`"
+            echo
+            echo "Pin these in the consumer repository — tag AND digest, because a tag"
+            echo "names a build and only a digest addresses one:"
+            echo
+            echo '```'
+            echo "DSTACK_VERSION"
+            echo "${{ steps.version.outputs.version }}"
+            echo
+            echo "DSTACK_IMAGE"
+            echo "$IMAGE:${{ steps.version.outputs.tag }}@${{ steps.server.outputs.digest }}"
+            echo
+            echo "DSTACK_BINARIES_IMAGE"
+            echo "$IMAGE:${{ steps.version.outputs.tag }}-binaries@${{ steps.binaries.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
