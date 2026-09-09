@@ -610,37 +610,6 @@ unchanged. Both are digest-pinned now.
 Bumping either is a deliberate edit here plus a rebuild and republish of the
 binaries image, exactly as for the server base.
 
-### Publish the images to GHCR
-
-`.github/workflows/carbonteq-publish.yml` builds the server and binaries images
-on every push to `dstack-cp-mvp` and pushes them to
-`ghcr.io/carbonteq-ai/dstack-carbonteq`, tagged with the version `version.sh`
-derives from the commit being built.
-
-It exists because the consumer repository has two consumers of a dstack server —
-its Dokploy deployment and the `app/compose.yaml` that CI and its contract tests
-boot. While one built from source and the other pulled a published image, the two
-could disagree about what a commit meant and a bump had to move four pins in step.
-One image, built once, pulled by both, addressed by digest.
-
-GHCR rather than Docker Hub: public packages are free, the namespace belongs to
-the organisation rather than to a person, and `GITHUB_TOKEN` publishes with no
-secret to manage.
-
-**The package must be set Public once**, after the first run. A package published
-by `GITHUB_TOKEN` starts private, and a private one puts a registry credential
-back on the deploy host — the thing this removes.
-
-**Rebase surface: none.** Upstream has no workflow of this name, and this one
-touches nothing upstream builds. Upstream's own `docker.yml` publishes different
-images to Docker Hub from a self-hosted runner and is untouched.
-
-**Retirement: when nothing pulls these images** — either because the consumer
-builds from source again, or because upstream publishes a build carrying the
-deltas above. Deleting the workflow does not fail anything here; it strands the
-consumer's pins at the last commit that was published, which its own
-`harness/checks/dstack-ref.sh` fails on rather than deploying silently.
-
 ### The root `.dockerignore`
 
 Not a behaviour change, and recorded here because it changes the context of
