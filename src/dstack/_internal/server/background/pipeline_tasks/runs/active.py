@@ -2,7 +2,7 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import load_only
@@ -13,6 +13,7 @@ from dstack._internal.core.models.profiles import RetryEvent, StopCriteria
 from dstack._internal.core.models.runs import (
     JobStatus,
     JobTerminationReason,
+    Retry,
     RunSpec,
     RunStatus,
     RunTerminationReason,
@@ -225,15 +226,13 @@ async def _analyze_active_run_replica(
             if retry_evaluation is None:
                 contributed_statuses.add(RunStatus.FAILED)
                 termination_reasons.add(RunTerminationReason.JOB_FAILED)
-            elif _is_retry_limit_exceeded(
-                run_model, job_model, retry_evaluation[0], retry_evaluation[1]
-            ):
+            elif _is_retry_limit_exceeded(run_model, job_model, retry_evaluation):
                 contributed_statuses.add(RunStatus.FAILED)
                 termination_reasons.add(RunTerminationReason.RETRY_LIMIT_EXCEEDED)
             else:
                 needs_retry = True
-                retry_event = retry_evaluation[0]
-                retry_duration = retry_evaluation[1]
+                retry_event = retry_evaluation.event
+                retry_duration = retry_evaluation.elapsed
             continue
 
         raise ServerError(f"Unexpected job status {job_model.status}")
@@ -301,16 +300,43 @@ def _job_needs_retry_evaluation(job_model: JobModel) -> bool:
     )
 
 
+class _RetryEvaluation(NamedTuple):
+    """A retryable failure and the budget it is judged against.
+
+    `event` and `elapsed` are what is recorded: the event's attempt count and its
+    first occurrence. `budget_event` and `budget_elapsed` are what the deadline is
+    checked against. They differ only for a replacement's capacity wait; see
+    `_replacement_budget_started_at`.
+    """
+
+    event: RetryEvent
+    elapsed: timedelta
+    budget_event: RetryEvent
+    budget_elapsed: timedelta
+
+
+def _own_budget(retry_event: RetryEvent, elapsed: timedelta) -> _RetryEvaluation:
+    return _RetryEvaluation(retry_event, elapsed, retry_event, elapsed)
+
+
 async def _should_retry_job(
     run_model: RunModel,
     job_model: JobModel,
-) -> Optional[Tuple[RetryEvent, timedelta]]:
+) -> Optional[_RetryEvaluation]:
     """
     Checks if the job should be retried and returns its event and elapsed budget.
 
     `no-capacity` is anchored to initial submission. Provisioned retry events
     are anchored to their compact first-event timestamp, or to the current
     failed submission while that timestamp is being recorded.
+
+    A `no-capacity` failure after a provisioned submission, on a run that retries
+    `interruption` and has recorded one, is a replacement that found no capacity
+    after a reclaim. Its wait is judged against the interruption budget instead,
+    measured from the first interruption, because the no-capacity budget is
+    anchored once per run and the first start may have used it up. It still
+    counts as a `no-capacity` attempt, never as an interruption recovery: an
+    empty offer lookup creates no machine.
     """
     job_spec = get_job_spec(job_model)
     if job_spec.retry is None:
@@ -337,7 +363,7 @@ async def _should_retry_job(
             # retrying. Retryable failures go back to PENDING directly, and the terminating worker
             # advances `next_triggered_at` only when the current execution is over.
             retry_started_at = run_model.next_triggered_at
-        return retry_event, get_current_datetime() - retry_started_at
+        return _own_budget(retry_event, get_current_datetime() - retry_started_at)
 
     if last_provisioned is not None:
         retry_state = _load_retry_state(run_model)
@@ -347,9 +373,34 @@ async def _should_retry_job(
             if isinstance(first_at, str)
             else job_model.last_processed_at
         )
-        return retry_event, get_current_datetime() - retry_started_at
+        now = get_current_datetime()
+        evaluation = _own_budget(retry_event, now - retry_started_at)
+        budget_started_at = _replacement_budget_started_at(
+            job_spec.retry, retry_event, retry_state
+        )
+        if budget_started_at is not None:
+            return evaluation._replace(
+                budget_event=RetryEvent.INTERRUPTION,
+                budget_elapsed=now - budget_started_at,
+            )
+        return evaluation
 
     return None
+
+
+def _replacement_budget_started_at(
+    retry: Retry, retry_event: RetryEvent, retry_state: Dict[str, dict]
+) -> Optional[datetime]:
+    """When the interruption budget a replacement's capacity wait belongs to began.
+
+    Called only once a submission has been provisioned. `None` keeps upstream's
+    anchor: for any event but `no-capacity`, for a run that does not retry
+    `interruption`, and for one that has recorded no interruption yet.
+    """
+    if retry_event != RetryEvent.NO_CAPACITY or RetryEvent.INTERRUPTION not in retry.on_events:
+        return None
+    first_at = retry_state.get(RetryEvent.INTERRUPTION.value, {}).get("first_at")
+    return datetime.fromisoformat(first_at) if isinstance(first_at, str) else None
 
 
 async def _load_last_provisioned_job(
@@ -377,18 +428,21 @@ async def _load_last_provisioned_job(
 def _is_retry_limit_exceeded(
     run_model: RunModel,
     job_model: JobModel,
-    retry_event: RetryEvent,
-    current_duration: timedelta,
+    evaluation: _RetryEvaluation,
 ) -> bool:
     job_spec = get_job_spec(job_model)
     if job_spec.retry is None:
         return True
-    max_attempts = job_spec.retry.max_attempts_for(retry_event)
-    state = _load_retry_state(run_model).get(retry_event.value, {})
+    # Attempts are capped per event. The deadline is the budget's, so a
+    # replacement's empty lookups never touch the interruption attempt cap.
+    max_attempts = job_spec.retry.max_attempts_for(evaluation.event)
+    state = _load_retry_state(run_model).get(evaluation.event.value, {})
     attempts = state.get("attempts", 0)
     if max_attempts is not None and attempts >= max_attempts:
         return True
-    return current_duration >= timedelta(seconds=job_spec.retry.duration_for(retry_event))
+    return evaluation.budget_elapsed >= timedelta(
+        seconds=job_spec.retry.duration_for(evaluation.budget_event)
+    )
 
 
 def _load_retry_state(run_model: RunModel) -> Dict[str, dict]:

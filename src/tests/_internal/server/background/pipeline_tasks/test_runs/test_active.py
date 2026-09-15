@@ -1,6 +1,6 @@
 import json
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -46,6 +46,67 @@ from tests._internal.server.background.pipeline_tasks.test_runs.helpers import (
     lock_run,
     run_to_pipeline_item,
 )
+
+
+def _spot_retry(*, arm_interruption: bool = True) -> ProfileRetry:
+    """The control plane's dispatched shape: an hour for capacity, and two
+    recoveries within two hours of the first interruption."""
+    if not arm_interruption:
+        return ProfileRetry(duration=3600, on_events=[RetryEvent.NO_CAPACITY])
+    return ProfileRetry(
+        duration=3600,
+        duration_by_event={RetryEvent.INTERRUPTION: 7200},
+        max_attempts_by_event={RetryEvent.INTERRUPTION: 2},
+        on_events=[RetryEvent.NO_CAPACITY, RetryEvent.INTERRUPTION],
+    )
+
+
+async def _create_replacement_without_capacity(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    retry: ProfileRetry,
+    retry_state: dict,
+    run_submitted_at: datetime,
+):
+    """A run whose first submission was provisioned and reclaimed, and whose
+    replacement then found no offer."""
+    project = await create_project(session=session)
+    user = await create_user(session=session)
+    repo = await create_repo(session=session, project_id=project.id)
+    run = await create_run(
+        session=session,
+        project=project,
+        repo=repo,
+        user=user,
+        run_spec=get_run_spec(repo_id=repo.name, profile=Profile(name="default", retry=retry)),
+        status=RunStatus.SUBMITTED,
+        submitted_at=run_submitted_at,
+        retry_state=json.dumps(retry_state),
+        resubmission_attempt=1,
+    )
+    await create_job(
+        session=session,
+        run=run,
+        status=JobStatus.FAILED,
+        termination_reason=JobTerminationReason.INTERRUPTED_BY_NO_CAPACITY,
+        submission_num=0,
+        job_provisioning_data=get_job_provisioning_data(),
+        submitted_at=run_submitted_at,
+        last_processed_at=now - timedelta(minutes=1),
+    )
+    await create_job(
+        session=session,
+        run=run,
+        status=JobStatus.FAILED,
+        termination_reason=JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY,
+        submission_num=1,
+        submitted_at=now - timedelta(seconds=30),
+        last_processed_at=now,
+    )
+    lock_run(run)
+    await session.commit()
+    return run
 
 
 @pytest.mark.asyncio
@@ -318,6 +379,184 @@ class TestRunActiveWorker:
         )
         lock_run(run)
         await session.commit()
+
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.runs.active.get_current_datetime",
+            return_value=now,
+        ):
+            await worker.process(run_to_pipeline_item(run))
+
+        await session.refresh(run)
+        assert run.status == RunStatus.TERMINATING
+        assert run.termination_reason == RunTerminationReason.RETRY_LIMIT_EXCEEDED
+
+    async def test_a_reclaimed_spot_runs_replacement_waits_for_capacity(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        """Submitted at 18:00 with no spot stock, placed at 18:02, reclaimed at 21:00,
+        and the replacement finds no offer at 21:01. Against the no-capacity budget
+        anchored at 18:00 that is 3h01m of one hour. The interruption budget has used
+        one minute of two hours, so the run goes back to pending."""
+        now = get_current_datetime()
+        submitted_at = now - timedelta(hours=3, minutes=1)
+        run = await _create_replacement_without_capacity(
+            session,
+            now=now,
+            retry=_spot_retry(),
+            run_submitted_at=submitted_at,
+            retry_state={
+                "no-capacity": {"attempts": 1, "first_at": submitted_at.isoformat()},
+                "interruption": {
+                    "attempts": 1,
+                    "first_at": (now - timedelta(minutes=1)).isoformat(),
+                },
+            },
+        )
+
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.runs.active.get_current_datetime",
+            return_value=now,
+        ):
+            await worker.process(run_to_pipeline_item(run))
+
+        await session.refresh(run)
+        assert run.status == RunStatus.PENDING
+        state = json.loads(run.retry_state)
+        assert state["no-capacity"] == {"attempts": 2, "first_at": submitted_at.isoformat()}
+        assert state["interruption"]["attempts"] == 1
+
+    async def test_a_first_start_is_still_bound_by_the_no_capacity_budget(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        """Nothing was provisioned, so interruption being armed changes nothing: two
+        hours of an hour's capacity wait fails the run."""
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        now = get_current_datetime()
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=get_run_spec(
+                repo_id=repo.name, profile=Profile(name="default", retry=_spot_retry())
+            ),
+            status=RunStatus.SUBMITTED,
+            submitted_at=now - timedelta(hours=2),
+        )
+        await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.FAILED,
+            termination_reason=JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY,
+            last_processed_at=now,
+        )
+        lock_run(run)
+        await session.commit()
+
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.runs.active.get_current_datetime",
+            return_value=now,
+        ):
+            await worker.process(run_to_pipeline_item(run))
+
+        await session.refresh(run)
+        assert run.status == RunStatus.TERMINATING
+        assert run.termination_reason == RunTerminationReason.RETRY_LIMIT_EXCEEDED
+
+    async def test_a_replacement_past_the_interruption_window_still_fails(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        """The first interruption was 2h01m ago against a two-hour budget. The
+        no-capacity budget alone would still allow the wait, which is how this
+        shows the interruption window is what ends it."""
+        now = get_current_datetime()
+        run = await _create_replacement_without_capacity(
+            session,
+            now=now,
+            retry=_spot_retry(),
+            run_submitted_at=now - timedelta(hours=3),
+            retry_state={
+                "no-capacity": {
+                    "attempts": 1,
+                    "first_at": (now - timedelta(minutes=5)).isoformat(),
+                },
+                "interruption": {
+                    "attempts": 1,
+                    "first_at": (now - timedelta(hours=2, minutes=1)).isoformat(),
+                },
+            },
+        )
+
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.runs.active.get_current_datetime",
+            return_value=now,
+        ):
+            await worker.process(run_to_pipeline_item(run))
+
+        await session.refresh(run)
+        assert run.status == RunStatus.TERMINATING
+        assert run.termination_reason == RunTerminationReason.RETRY_LIMIT_EXCEEDED
+
+    async def test_empty_offer_lookups_do_not_use_up_interruption_recoveries(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        """Both recoveries are spent and the second replacement has already come back
+        empty five times. None of those lookups created a machine, so none is a
+        recovery: the cap is not hit and the interruption count does not move."""
+        now = get_current_datetime()
+        run = await _create_replacement_without_capacity(
+            session,
+            now=now,
+            retry=_spot_retry(),
+            run_submitted_at=now - timedelta(hours=3),
+            retry_state={
+                "no-capacity": {
+                    "attempts": 5,
+                    "first_at": (now - timedelta(hours=3)).isoformat(),
+                },
+                "interruption": {
+                    "attempts": 2,
+                    "first_at": (now - timedelta(minutes=10)).isoformat(),
+                },
+            },
+        )
+
+        with patch(
+            "dstack._internal.server.background.pipeline_tasks.runs.active.get_current_datetime",
+            return_value=now,
+        ):
+            await worker.process(run_to_pipeline_item(run))
+
+        await session.refresh(run)
+        assert run.status == RunStatus.PENDING
+        state = json.loads(run.retry_state)
+        assert state["interruption"]["attempts"] == 2
+        assert state["no-capacity"]["attempts"] == 6
+
+    async def test_a_run_that_does_not_retry_interruption_keeps_the_per_run_anchor(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        """Without `interruption` in `on_events` the upstream anchor stands, so a
+        provisioned run's capacity wait is still measured from its stored
+        no-capacity `first_at`. The reclaimed first submission is only a way to
+        have been provisioned; this spec would not have retried it."""
+        now = get_current_datetime()
+        submitted_at = now - timedelta(hours=3, minutes=1)
+        run = await _create_replacement_without_capacity(
+            session,
+            now=now,
+            retry=_spot_retry(arm_interruption=False),
+            run_submitted_at=submitted_at,
+            retry_state={
+                "no-capacity": {"attempts": 1, "first_at": submitted_at.isoformat()},
+                "interruption": {
+                    "attempts": 1,
+                    "first_at": (now - timedelta(minutes=1)).isoformat(),
+                },
+            },
+        )
 
         with patch(
             "dstack._internal.server.background.pipeline_tasks.runs.active.get_current_datetime",
