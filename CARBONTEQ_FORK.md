@@ -228,6 +228,51 @@ Pending resubmissions retain the upstream exponential sequence (15 seconds,
 and apply stable per-run, per-attempt jitter in the range of minus to plus 20
 percent. Stable jitter prevents a polling cycle from moving its own deadline.
 
+**A replacement's capacity wait belongs to the interruption budget** (control
+plane C-67, 2026-09-15). The no-capacity budget is anchored once per run: at
+initial submission, and after provisioning at its stored `first_at`, which is
+never reset. So a spot run that waited for its first machine, or is on a later
+recovery, had no wait left when its replacement found no offer after a reclaim.
+It failed `retry_limit_exceeded` on the first empty lookup, which ended the
+recovery this delta exists to allow. A reclaim is the provider taking capacity
+back, so an empty first lookup is the likely case, not the rare one.
+
+`_should_retry_job` now returns a `_RetryEvaluation` that separates the event it
+records from the budget it checks. A `no-capacity` failure after a provisioned
+submission is judged against `duration_for(interruption)`, measured from the
+first interruption, when the run's `on_events` include `interruption` and its
+`retry_state` has recorded one. It is still recorded, and capped, as a
+`no-capacity` attempt. The interruption attempt count and cap do not move,
+because an empty lookup creates no machine: counting lookups as recoveries would
+end a run after two backoffs. The first start, runs that do not retry
+`interruption`, and every other event keep the anchors above.
+
+Under the reference configuration this shortens a replacement's wait. Before, it
+was what remained of 24 hours since initial submission. Now it is what remains of
+two hours since the first interruption. That is the stated meaning of "two hours
+from the first interruption, never reset": no recovery starts after it. The
+CarbonTeq control plane sends at most an hour for no-capacity and at most two for
+interruption, and under the per-run anchor its replacements got no wait at all.
+
+Touches `server/background/pipeline_tasks/runs/active.py` only:
+`_should_retry_job`, `_is_retry_limit_exceeded` (it now takes the evaluation), the
+single call site in `_analyze_active_run_replica`, and a new
+`_replacement_budget_started_at`. Coverage is five tests in
+`src/tests/_internal/server/background/pipeline_tasks/test_runs/test_active.py`,
+beside `test_interruption_retry_budget_is_anchored_to_first_interruption`. They
+cover the C-67 timeline recovering, a replacement past the interruption window
+still failing, empty lookups not spending recoveries, and two cases that do not
+change: the first start still bound by the no-capacity budget, and the per-run
+anchor kept when `interruption` is not retried. The first three fail against
+`30472de`.
+
+*Rebase.* A hot pipeline file. Read `_should_retry_job`,
+`_is_retry_limit_exceeded` and `_record_retry_events` as one unit. Upstream has
+neither `retry_state` nor per-event budgets, so a conflict there means this whole
+delta needs re-deriving, not only the replacement rule. *Retire* it with the
+delta, or earlier if upstream lets a retry event be judged by another event's
+budget.
+
 ### Keep environment values out of diagnostic logs
 
 The runner previously attached the complete `cmd.Env` list to its `Starting
@@ -577,6 +622,13 @@ migration test. The broader run/submitted pipeline has 94 passes, 101
 PostgreSQL skips, and exactly the same eight unrelated SQLite multinode and
 placement failures. No production or provider canary was run for this policy
 follow-up.
+
+The replacement-capacity-wait successor (C-67) passes all 29 SQLite tests in
+`test_runs/test_active.py`, with 29 PostgreSQL variants skipped. Three of its five
+new tests fail against `30472de`. The whole `background/pipeline_tasks` test
+directory has 461 passes, 451 PostgreSQL skips and no failure on SQLite. Ruff
+check and format are clean. No spot reclaim, production run or provider canary
+has exercised it.
 
 The availability-first region successor passes all 30 selected RunPod backend,
 managed-storage, rotation, and cooldown tests (with three PostgreSQL variants
