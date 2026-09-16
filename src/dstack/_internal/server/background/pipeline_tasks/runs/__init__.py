@@ -333,6 +333,10 @@ async def _load_pending_context(
         secrets=secrets,
         locked_job_ids=locked_job_ids,
         gateway_stats=gateway_stats,
+        # CarbonTeq delta (D-49): see pending.capacity_released_since_last_attempt().
+        capacity_released=await pending.capacity_released_since_last_attempt(
+            session=session, run_model=run_model
+        ),
     )
 
 

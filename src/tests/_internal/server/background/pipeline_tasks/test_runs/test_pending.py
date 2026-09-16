@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dstack._internal.core.models.configurations import ScalingSpec, ServiceConfiguration
+from dstack._internal.core.models.instances import InstanceStatus
 from dstack._internal.core.models.resources import Range
 from dstack._internal.core.models.runs import (
     JobStatus,
@@ -18,6 +19,7 @@ from dstack._internal.server.background.pipeline_tasks.runs import RunWorker
 from dstack._internal.server.background.pipeline_tasks.runs.pending import _get_retry_delay
 from dstack._internal.server.models import JobModel
 from dstack._internal.server.testing.common import (
+    create_instance,
     create_job,
     create_project,
     create_repo,
@@ -367,6 +369,176 @@ class TestRunPendingWorker:
         res = await session.execute(select(JobModel).where(JobModel.run_id == run.id))
         jobs = list(res.scalars().all())
         assert len(jobs) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+@pytest.mark.usefixtures("image_config_mock")
+class TestWakeOnRelease:
+    """
+    CarbonTeq delta (D-49). A run waiting for capacity is retried as soon as an instance
+    in its project frees a block after its last attempt began, not at its next backoff
+    step. Measured on production 2026-09-16: slots idled 5 and 8 minutes while runs that
+    fitted them sat between backoff steps.
+    """
+
+    async def _waiting_run(
+        self,
+        session: AsyncSession,
+        *,
+        attempt_submitted_ago: timedelta = timedelta(seconds=20),
+        termination_reason: JobTerminationReason = (
+            JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        ),
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        # Attempt 5 is the five-minute step, so only a wake can resubmit it within the test.
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            status=RunStatus.PENDING,
+            resubmission_attempt=5,
+        )
+        now = get_current_datetime()
+        await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.FAILED,
+            submitted_at=now - attempt_submitted_ago,
+            last_processed_at=now,
+            termination_reason=termination_reason,
+        )
+        return project, run
+
+    async def _process(self, session: AsyncSession, worker: RunWorker, run) -> None:
+        lock_run(run)
+        await session.commit()
+        await worker.process(run_to_pipeline_item(run))
+        await session.refresh(run)
+
+    async def test_wake_on_release_resubmits_before_the_backoff_step(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        project, run = await self._waiting_run(session)
+        instance = await create_instance(session=session, project=project)
+        instance.last_job_processed_at = get_current_datetime() - timedelta(seconds=5)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.SUBMITTED
+
+    async def test_wake_on_release_counts_a_release_while_the_attempt_was_failing(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        # The 20:45:04 case: the attempt found no capacity, the slot freed a second later,
+        # and the attempt's job was marked failed after that. Its last_processed_at is
+        # later than the release; its submitted_at is not.
+        project, run = await self._waiting_run(
+            session, attempt_submitted_ago=timedelta(seconds=16)
+        )
+        instance = await create_instance(session=session, project=project)
+        instance.last_job_processed_at = get_current_datetime() - timedelta(seconds=1)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.SUBMITTED
+
+    async def test_wake_on_release_ignores_a_release_before_the_attempt(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        project, run = await self._waiting_run(session)
+        instance = await create_instance(session=session, project=project)
+        instance.last_job_processed_at = get_current_datetime() - timedelta(minutes=1)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.PENDING
+
+    async def test_wake_on_release_ignores_an_instance_with_no_free_block(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        project, run = await self._waiting_run(session)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            status=InstanceStatus.BUSY,
+            total_blocks=1,
+            busy_blocks=1,
+        )
+        instance.last_job_processed_at = get_current_datetime() - timedelta(seconds=5)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.PENDING
+
+    async def test_wake_on_release_frees_a_block_on_a_shared_instance(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        project, run = await self._waiting_run(session)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            status=InstanceStatus.BUSY,
+            total_blocks=4,
+            busy_blocks=3,
+        )
+        instance.last_job_processed_at = get_current_datetime() - timedelta(seconds=5)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.SUBMITTED
+
+    async def test_wake_on_release_ignores_another_projects_instance(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        _, run = await self._waiting_run(session)
+        other_owner = await create_user(session=session, name="other_owner")
+        other = await create_project(session=session, owner=other_owner, name="other")
+        instance = await create_instance(session=session, project=other)
+        instance.last_job_processed_at = get_current_datetime() - timedelta(seconds=5)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.PENDING
+
+    async def test_wake_on_release_ignores_unreachable_and_terminating_instances(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        project, run = await self._waiting_run(session)
+        released = get_current_datetime() - timedelta(seconds=5)
+        unreachable = await create_instance(
+            session=session, project=project, unreachable=True, name="unreachable"
+        )
+        unreachable.last_job_processed_at = released
+        terminating = await create_instance(
+            session=session,
+            project=project,
+            status=InstanceStatus.TERMINATING,
+            name="terminating",
+        )
+        terminating.last_job_processed_at = released
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.PENDING
+
+    async def test_wake_on_release_keeps_the_backoff_for_other_failures(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        # An error or interruption retry is a crash loop, not a wait for a slot.
+        project, run = await self._waiting_run(
+            session, termination_reason=JobTerminationReason.CONTAINER_EXITED_WITH_ERROR
+        )
+        instance = await create_instance(session=session, project=project)
+        instance.last_job_processed_at = get_current_datetime() - timedelta(seconds=5)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.PENDING
 
 
 def test_retry_backoff_has_stable_twenty_percent_jitter_and_ten_minute_base_cap() -> None:
