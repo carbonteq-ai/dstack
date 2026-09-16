@@ -485,6 +485,81 @@ while a cron still does — and
 `test_creates_pending_run_if_run_has_a_one_shot_start` in
 `src/tests/_internal/server/routers/test_runs.py`.
 
+### Priority gate at placement
+
+Control plane ADR-046 and S-29, 2026-09-16. Upstream reads `RunModel.priority`
+in one place, the submitted-jobs fetch's `ORDER BY`, and on a fleet that is not
+saturated it decides almost nothing. A new job is fetched alone. A shared batch
+is placed by concurrent workers racing for the instance lock. A run waiting for
+capacity retries on its own jittered timer. Measured on the CarbonTeq
+deployment, a priority-29 run took a host that a waiting priority-99 run
+fitted: on an idle host by arriving first, after a release by its timer firing
+first, and from a same-second batch in priority order, because the 99s were
+attempted first against a still-busy host.
+
+In `_select_assignment`, once `find_optimal_fleet_with_offers` has returned
+existing-instance offers, the job **yields** if a waiting run of strictly higher
+priority fits one of those instances. Yielding returns the pipeline's existing
+`_DeferSubmittedJobResult`. The job is not failed, uses no retry attempt, and is
+fetched again after `min_processing_interval`.
+
+- **Waiting** means one of two things. The run is `SUBMITTED` with its master job
+  `SUBMITTED` and not yet `instance_assigned`. Or it is `PENDING` with
+  `resubmission_attempt > 0` and its latest master job ended
+  `FAILED_TO_START_DUE_TO_NO_CAPACITY`. Waiters are taken from the job's project,
+  highest priority first, 50 fetched and at most 10 fit-checked.
+- **Held runs never count.** A run held for a window or a schedule is `PENDING`
+  with `resubmission_attempt == 0`, so a closed window cannot block the fleet.
+- **Fits** is dstack's own `get_instance_offers_from_instances` for the waiter's
+  stored job spec against the offered instances. The waiter's `fleet_id` and
+  `fleets` pins are checked first. A multinode waiter never fits a single slot.
+- **Bounded** by the yielding run's no-capacity retry window, anchored where
+  `_should_retry_job` anchors a first start (`submitted_at`, or
+  `next_triggered_at`). A run with no `no-capacity` retry is not gated at all,
+  since nothing would end its yield.
+- **Equal priority never yields.** Order within a priority stays as upstream has it.
+- **It fails open.** Any exception is logged and the job places normally.
+- **Not gated:** jobs with `job_num > 0` or of a multinode run, whose cluster is
+  already forming; targeted `instances` placement; and new capacity, which is a
+  market rather than a slot.
+
+This is not strict head-of-line priority. A higher run that fits none of the
+offered instances blocks nobody.
+
+**It depends on "Wake a run waiting for capacity when an instance frees a
+block".** Without that delta, a lower run that yields to a higher run sleeping
+between backoff steps leaves the slot idle for up to ten minutes. Release the two
+together.
+
+The logic is an additive module,
+`server/background/pipeline_tasks/priority_gate.py`. The upstream file changes
+by one import and one call in `_select_assignment` in `jobs_submitted.py`.
+Coverage is `TestPriorityGate` in
+`src/tests/_internal/server/background/pipeline_tasks/test_submitted_jobs.py`,
+nine cases on SQLite and PostgreSQL:
+
+- **Yields** to a submitted higher waiter that fits, and to a higher run
+  retrying for capacity.
+- **Places normally** when the higher run fits nothing (control plane trap 8),
+  for a held higher run, at equal priority, past the retry window, without a
+  no-capacity retry, and when the gate raises.
+- **A batch processed low first** yields the low job and places the high one.
+
+The three yield cases fail with the gate disabled. The whole
+`pipeline_tasks/` suite gives 470 passed with 460 PostgreSQL skips, and the
+submitted-jobs file fails nothing before or after.
+
+*Not covered.* Volumes are not part of the waiter's fit, so a waiter whose volume
+cannot attach to the instance still counts, bounded by the yielding run's window.
+Fleets imported from another project are not searched for waiters.
+
+*Rebase.* Re-read `_select_assignment` and `find_optimal_fleet_with_offers`'s
+return shape. The gate needs existing-instance offers before any instance is
+locked. If upstream moves instance choice under the lock, the call has to move
+with it. Re-check `get_instance_offers_from_instances`' signature and the
+`instance_assigned` meaning. *Retire* it if upstream placement becomes
+priority-aware across concurrent workers and pending retries.
+
 ## Fixed: version.sh described the wrong repository
 
 `version.sh` exists so a release version cannot be forgotten. Both of its

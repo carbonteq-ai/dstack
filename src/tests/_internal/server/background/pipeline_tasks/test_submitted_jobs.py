@@ -14,7 +14,11 @@ from dstack._internal.core.backends.runpod.models import RunpodRunStorageConfig
 from dstack._internal.core.errors import BackendError
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.common import EntityReference, NetworkMode, RegistryAuth
-from dstack._internal.core.models.configurations import ServiceConfiguration, TaskConfiguration
+from dstack._internal.core.models.configurations import (
+    DevEnvironmentConfiguration,
+    ServiceConfiguration,
+    TaskConfiguration,
+)
 from dstack._internal.core.models.envs import Env
 from dstack._internal.core.models.fleets import FleetNodesSpec, InstanceGroupPlacement
 from dstack._internal.core.models.instances import InstanceStatus
@@ -26,6 +30,8 @@ from dstack._internal.core.models.profiles import (
     InstanceNameSelector,
     InstanceSelector,
     Profile,
+    ProfileRetry,
+    RetryEvent,
     SpotPolicy,
 )
 from dstack._internal.core.models.provisioning_preconditions import (
@@ -35,7 +41,12 @@ from dstack._internal.core.models.provisioning_preconditions import (
     ResolvedHTTPImageReadinessConfig,
 )
 from dstack._internal.core.models.resources import CPUSpec, Memory, Range, ResourcesSpec
-from dstack._internal.core.models.runs import JobRuntimeData, JobStatus, JobTerminationReason
+from dstack._internal.core.models.runs import (
+    JobRuntimeData,
+    JobStatus,
+    JobTerminationReason,
+    RunStatus,
+)
 from dstack._internal.core.models.users import GlobalRole
 from dstack._internal.core.models.volumes import (
     RunpodVolumeConfiguration,
@@ -3303,3 +3314,236 @@ class TestLoadSubmittedJobContext:
         # Only the latest submission should be loaded.
         assert len(context.run_model.jobs) == 1
         assert context.run_model.jobs[0].id == latest_job.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+class TestPriorityGate:
+    """
+    CarbonTeq delta (ADR-046). A job about to take an existing instance yields when a
+    waiting run of strictly higher priority fits one of those instances.
+    """
+
+    async def _setup(self, session: AsyncSession):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session, project=project, fleet=fleet, status=InstanceStatus.IDLE
+        )
+        return project, user, repo, fleet, instance
+
+    async def _run(
+        self,
+        session: AsyncSession,
+        project,
+        user,
+        repo,
+        name: str,
+        priority: int,
+        *,
+        status: RunStatus = RunStatus.SUBMITTED,
+        retry: bool = True,
+        submitted_ago: timedelta = timedelta(seconds=5),
+        resources: ResourcesSpec | None = None,
+        resubmission_attempt: int = 0,
+        next_triggered_at=None,
+    ):
+        profile = Profile(name="default")
+        if retry:
+            profile.retry = ProfileRetry(on_events=[RetryEvent.NO_CAPACITY], duration=3600)
+        configuration = DevEnvironmentConfiguration(ide="vscode")
+        if resources is not None:
+            configuration.resources = resources
+        run_spec = get_run_spec(
+            run_name=name, repo_id=repo.name, profile=profile, configuration=configuration
+        )
+        return await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_name=name,
+            run_spec=run_spec,
+            priority=priority,
+            status=status,
+            submitted_at=get_current_datetime() - submitted_ago,
+            resubmission_attempt=resubmission_attempt,
+            next_triggered_at=next_triggered_at,
+        )
+
+    async def _assert_placed(self, session: AsyncSession, job: JobModel, instance) -> None:
+        job = await _get_job(session, job.id)
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == instance.id
+
+    async def _assert_yielded(self, session: AsyncSession, job: JobModel) -> None:
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.SUBMITTED
+        assert not job.instance_assigned
+        assert job.instance is None
+        assert job.lock_token is None
+
+    async def test_priority_gate_yields_to_a_higher_waiter_that_fits(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project, user, repo, _, _ = await self._setup(session)
+        low = await self._run(session, project, user, repo, "low", 29)
+        low_job = await create_job(session=session, run=low)
+        high = await self._run(session, project, user, repo, "high", 99)
+        await create_job(session=session, run=high)
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+
+        await self._assert_yielded(session, low_job)
+
+    async def test_priority_gate_yields_to_a_higher_run_retrying_for_capacity(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project, user, repo, _, _ = await self._setup(session)
+        low = await self._run(session, project, user, repo, "low", 29)
+        low_job = await create_job(session=session, run=low)
+        high = await self._run(
+            session,
+            project,
+            user,
+            repo,
+            "high",
+            99,
+            status=RunStatus.PENDING,
+            resubmission_attempt=3,
+        )
+        await create_job(
+            session=session,
+            run=high,
+            status=JobStatus.FAILED,
+            termination_reason=JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY,
+        )
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+
+        await self._assert_yielded(session, low_job)
+
+    async def test_priority_gate_does_not_yield_to_a_higher_run_that_fits_nothing(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        # Trap 8: a higher run that cannot be placed must not block a lower one that fits.
+        project, user, repo, _, instance = await self._setup(session)
+        low = await self._run(session, project, user, repo, "low", 29)
+        low_job = await create_job(session=session, run=low)
+        high = await self._run(
+            session,
+            project,
+            user,
+            repo,
+            "high",
+            99,
+            resources=ResourcesSpec(cpu=CPUSpec.parse("512..")),
+        )
+        await create_job(session=session, run=high)
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+
+        await self._assert_placed(session, low_job, instance)
+
+    async def test_priority_gate_ignores_a_held_run(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project, user, repo, _, instance = await self._setup(session)
+        low = await self._run(session, project, user, repo, "low", 29)
+        low_job = await create_job(session=session, run=low)
+        await self._run(
+            session,
+            project,
+            user,
+            repo,
+            "high-held",
+            99,
+            status=RunStatus.PENDING,
+            next_triggered_at=get_current_datetime() + timedelta(hours=2),
+        )
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+
+        await self._assert_placed(session, low_job, instance)
+
+    async def test_priority_gate_never_yields_to_equal_priority(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project, user, repo, _, instance = await self._setup(session)
+        first = await self._run(session, project, user, repo, "first", 69)
+        first_job = await create_job(session=session, run=first)
+        second = await self._run(session, project, user, repo, "second", 69)
+        await create_job(session=session, run=second)
+
+        await _process_job(session=session, worker=worker, job_model=first_job)
+
+        await self._assert_placed(session, first_job, instance)
+
+    async def test_priority_gate_stops_yielding_past_the_retry_window(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project, user, repo, _, instance = await self._setup(session)
+        low = await self._run(
+            session, project, user, repo, "low", 29, submitted_ago=timedelta(hours=2)
+        )
+        low_job = await create_job(session=session, run=low)
+        high = await self._run(session, project, user, repo, "high", 99)
+        await create_job(session=session, run=high)
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+
+        await self._assert_placed(session, low_job, instance)
+
+    async def test_priority_gate_does_not_gate_a_run_without_a_no_capacity_retry(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        # With nothing to bound it, a yield would never end.
+        project, user, repo, _, instance = await self._setup(session)
+        low = await self._run(session, project, user, repo, "low", 29, retry=False)
+        low_job = await create_job(session=session, run=low)
+        high = await self._run(session, project, user, repo, "high", 99)
+        await create_job(session=session, run=high)
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+
+        await self._assert_placed(session, low_job, instance)
+
+    async def test_priority_gate_places_normally_when_the_gate_raises(
+        self,
+        test_db,
+        session: AsyncSession,
+        worker: JobSubmittedWorker,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        project, user, repo, _, instance = await self._setup(session)
+        low = await self._run(session, project, user, repo, "low", 29)
+        low_job = await create_job(session=session, run=low)
+        high = await self._run(session, project, user, repo, "high", 99)
+        await create_job(session=session, run=high)
+        monkeypatch.setattr(
+            "dstack._internal.server.background.pipeline_tasks.priority_gate"
+            "._load_higher_priority_waiters",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        )
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+
+        await self._assert_placed(session, low_job, instance)
+
+    async def test_priority_gate_places_the_high_run_from_a_batch_processed_low_first(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        # S-29's race: both reach dstack together and the low job is processed first.
+        project, user, repo, _, instance = await self._setup(session)
+        low = await self._run(session, project, user, repo, "low", 29)
+        low_job = await create_job(session=session, run=low)
+        high = await self._run(session, project, user, repo, "high", 99)
+        high_job = await create_job(session=session, run=high)
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+        await _process_job(session=session, worker=worker, job_model=high_job)
+
+        await self._assert_yielded(session, low_job)
+        await self._assert_placed(session, high_job, instance)
