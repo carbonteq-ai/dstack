@@ -74,6 +74,9 @@ from dstack._internal.server.background.pipeline_tasks.base import (
     log_lock_token_changed_on_reset,
     log_lock_token_mismatch,
 )
+from dstack._internal.server.background.pipeline_tasks.priority_gate import (
+    find_higher_priority_waiter,
+)
 from dstack._internal.server.db import (
     get_db,
     get_session_ctx,
@@ -577,6 +580,19 @@ async def _select_assignment(
         return _NoFleetAssignment()
 
     if fleet_instances_with_offers:
+        # CarbonTeq delta (ADR-046): yield an instance a waiting higher-priority run fits.
+        higher_priority_waiter = await find_higher_priority_waiter(
+            run_model=context.run_model,
+            job_model=context.job_model,
+            job=context.job,
+            multinode=context.multinode,
+            fleet_model=fleet_model,
+            instance_offers=fleet_instances_with_offers,
+        )
+        if higher_priority_waiter is not None:
+            return _DeferSubmittedJobResult(
+                log_message=f"yielding to higher-priority run {higher_priority_waiter}"
+            )
         return _ExistingInstanceAssignment(
             fleet_id=fleet_model.id,
             master_job_provisioning_data=preconditions.master_job_provisioning_data,
