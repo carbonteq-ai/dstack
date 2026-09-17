@@ -5,15 +5,19 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 
+from sqlalchemy import and_, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from dstack._internal.core.models.configurations import ServiceConfiguration
-from dstack._internal.core.models.runs import RunSpec, RunStatus
+from dstack._internal.core.models.instances import InstanceStatus
+from dstack._internal.core.models.runs import JobTerminationReason, RunSpec, RunStatus
 from dstack._internal.proxy.gateway.schemas.stats import PerWindowStats
 from dstack._internal.server.background.pipeline_tasks.base import ItemUpdateMap
 from dstack._internal.server.background.pipeline_tasks.runs.common import (
     build_scale_up_job_models,
     compute_desired_replica_counts,
 )
-from dstack._internal.server.models import JobModel, RunModel
+from dstack._internal.server.models import InstanceModel, JobModel, RunModel
 from dstack._internal.utils.common import get_current_datetime
 from dstack._internal.utils.logging import get_logger
 
@@ -33,6 +37,9 @@ class PendingContext:
     secrets: dict
     locked_job_ids: set[uuid.UUID]
     gateway_stats: Optional[PerWindowStats] = None
+    capacity_released: bool = False
+    """CarbonTeq: an instance in the run's project freed a block after the run's last
+    no-capacity attempt began. See `capacity_released_since_last_attempt()`."""
 
 
 @dataclass
@@ -50,7 +57,11 @@ async def process_pending_run(context: PendingContext) -> Optional[PendingResult
     run_model = context.run_model
     run_spec = context.run_spec
 
-    if run_model.resubmission_attempt > 0 and not _is_ready_for_resubmission(run_model):
+    if (
+        run_model.resubmission_attempt > 0
+        and not _is_ready_for_resubmission(run_model)
+        and not context.capacity_released
+    ):
         return None
 
     if run_spec.configuration.type == "service":
@@ -124,6 +135,56 @@ def _is_ready_for_resubmission(run_model: RunModel) -> bool:
     return duration_since_processing >= _get_retry_delay(
         run_model.resubmission_attempt, run_model.id
     )
+
+
+async def capacity_released_since_last_attempt(session: AsyncSession, run_model: RunModel) -> bool:
+    """
+    CarbonTeq delta (D-49): wake a run waiting for capacity when capacity comes back.
+
+    A run that failed for want of capacity is otherwise retried on the backoff ladder
+    below, which nothing shortens. A slot that frees just after a waiter's attempt then
+    sits idle until the next step, up to ten minutes, while the waiter could use it.
+
+    Returns True when the run's latest attempt ended `FAILED_TO_START_DUE_TO_NO_CAPACITY`
+    and an instance in the run's project has released a job since that attempt was
+    submitted, and still has a free block. `InstanceModel.last_job_processed_at` is set
+    only when a job is unassigned (`jobs_terminating.py`), so no new state is needed.
+
+    The anchor is the attempt's `submitted_at`, not its `last_processed_at`: an attempt
+    can find no capacity, the slot can free a second later, and the attempt's job is only
+    marked failed after that. Anchoring on the failure would miss that release.
+
+    Deliberately loose: whether the run fits the freed instance is not checked here, so a
+    wake can be wasted. That costs one attempt per waiter per release, since the woken
+    attempt's own `submitted_at` postdates the release. Placement decides the fit.
+    """
+    if run_model.resubmission_attempt <= 0 or not run_model.jobs:
+        return False
+    if not any(
+        job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        for job in run_model.jobs
+    ):
+        return False
+    last_attempt_at = max(job.submitted_at for job in run_model.jobs)
+    res = await session.execute(
+        select(InstanceModel.id)
+        .where(
+            InstanceModel.project_id == run_model.project_id,
+            InstanceModel.deleted == False,
+            InstanceModel.unreachable == False,
+            InstanceModel.status.in_([InstanceStatus.IDLE, InstanceStatus.BUSY]),
+            InstanceModel.last_job_processed_at > last_attempt_at,
+            or_(
+                InstanceModel.busy_blocks == 0,
+                and_(
+                    InstanceModel.total_blocks.is_not(None),
+                    InstanceModel.busy_blocks < InstanceModel.total_blocks,
+                ),
+            ),
+        )
+        .limit(1)
+    )
+    return res.scalar_one_or_none() is not None
 
 
 # We use exponentially increasing retry delays for pending runs.

@@ -273,6 +273,60 @@ delta needs re-deriving, not only the replacement rule. *Retire* it with the
 delta, or earlier if upstream lets a retry event be judged by another event's
 budget.
 
+### Wake a run waiting for capacity when an instance frees a block
+
+Control plane D-49, 2026-09-16. The backoff above is the only thing that
+decides when a run waiting for capacity tries again, and nothing shortens it.
+A slot that frees just after a waiter's attempt therefore sits idle until that
+waiter's next step, while the waiter fits it. Measured on the CarbonTeq
+deployment with one host and six waiters: the host idled 877 s of a 1,274 s
+test, in gaps of 5 min 7 s and 7 min 57 s, and 30 s of work took 21 minutes.
+
+A pending run with `resubmission_attempt > 0` is now also ready when its latest
+attempt ended `FAILED_TO_START_DUE_TO_NO_CAPACITY` and an instance in its
+project has released a job since that attempt was **submitted** and still has
+a free block (`busy_blocks == 0`, or `busy_blocks < total_blocks`), is `IDLE` or
+`BUSY`, reachable and not deleted. The release time is the existing
+`InstanceModel.last_job_processed_at`, which is written only when a job is
+unassigned (`jobs_terminating.py`), so there is no new column and no migration.
+The run pipeline already re-examines retrying runs every ten seconds, so a
+release is noticed within one fetch interval.
+
+The anchor is `JobModel.submitted_at`, not `last_processed_at`. An attempt can
+find no capacity, the slot can free a second later, and the attempt's job is
+only marked failed after that — measured, not hypothetical. Anchoring on the
+failure misses exactly that release.
+
+It is deliberately loose. Fit is not checked, so a wake can be wasted: at most
+one attempt per waiter per release, because the woken attempt's own
+`submitted_at` postdates the release. Every waiter in the project is woken, not
+only the highest priority. Placement decides who gets the slot, which today is
+a race (control plane S-29, ADR-046). Other retry events — `error`,
+`interruption` — keep the full backoff: a crash loop is not a wait for a slot.
+
+Touches `server/background/pipeline_tasks/runs/pending.py` (a new
+`capacity_released_since_last_attempt`, a `PendingContext.capacity_released`
+field and one condition in `process_pending_run`) and two lines in
+`runs/__init__.py`'s `_load_pending_context`. Coverage is `TestWakeOnRelease` in
+`src/tests/_internal/server/background/pipeline_tasks/test_runs/test_pending.py`,
+eight cases on SQLite and PostgreSQL: a release wakes the run, including one
+that happened while the attempt was being failed, and a freed block on a
+shared instance; a release before the attempt, an instance with no free block,
+another project's instance, an unreachable or terminating instance, and a
+non-capacity failure do not. The three positive cases fail against `1c03109`,
+and all three fail if the anchor is changed to `last_processed_at`.
+
+*Not covered.* A newly added instance that has never run a job has no
+`last_job_processed_at` and wakes nobody; its waiters keep their timers. Nor
+does a fleet imported from another project.
+
+*Rebase.* `process_pending_run`'s readiness condition and `_load_pending_context`
+are small, but they sit in a hot pipeline beside the jittered backoff. Check that
+`last_job_processed_at` is still written only on unassignment; if upstream starts
+writing it on assignment, every waiter would wake on every placement. *Retire*
+it if upstream wakes capacity waiters on release, or if the backoff stops
+applying to `no-capacity` retries.
+
 ### Keep environment values out of diagnostic logs
 
 The runner previously attached the complete `cmd.Env` list to its `Starting
