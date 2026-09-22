@@ -8,6 +8,9 @@ translation layer that seldom needs to change. The wire format:
     POST   /hosts         -> 201 SimHost | 409 {"error": "no_capacity", "message": ...}
     GET    /hosts/{id}    -> 200 SimHost | 404
     DELETE /hosts/{id}    -> 204 | 404
+
+Responses are parsed with `__response__`, which ignores unknown fields, so the
+controller can add fields (stock, fault state) without a change here.
 """
 
 from typing import List, Literal, Optional
@@ -56,7 +59,7 @@ class SimControllerClient:
 
     def list_offers(self) -> List[SimOffer]:
         resp = self._request("GET", "/offers")
-        return [SimOffer.parse_obj(o) for o in resp.json()["offers"]]
+        return [SimOffer.__response__.parse_obj(o) for o in resp.json()["offers"]]
 
     def create_host(
         self,
@@ -78,13 +81,13 @@ class SimControllerClient:
         )
         if resp.status_code == 409:
             raise NoCapacityError(_error_message(resp))
-        return SimHost.parse_obj(resp.json())
+        return SimHost.__response__.parse_obj(resp.json())
 
     def get_host(self, host_id: str) -> Optional[SimHost]:
         resp = self._request("GET", f"/hosts/{host_id}", allow=(404,))
         if resp.status_code == 404:
             return None
-        return SimHost.parse_obj(resp.json())
+        return SimHost.__response__.parse_obj(resp.json())
 
     def delete_host(self, host_id: str) -> None:
         self._request("DELETE", f"/hosts/{host_id}", allow=(404,))

@@ -641,7 +641,9 @@ one every gpuhunt backend uses. The sim has no filter of its own. A controller
 The controller, its catalogue, the host image and every fault live in the
 control-plane repository (`sim/`), not here. This package is deliberately a thin
 HTTP client (`core/backends/sim/client.py`, whose docstring is the wire format),
-so the simulator can grow without new fork deltas.
+so the simulator can grow without new fork deltas. It parses the controller's
+responses with `__response__`, which ignores unknown fields, because a strict
+parse would turn every field the controller adds into a failed run.
 
 **It never loads by accident.** `core/backends/sim/configurator.py` raises
 `ImportError` unless `DSTACK_SIM_ENABLED=1`, and `configurators.py` imports every
@@ -666,7 +668,7 @@ No migration: `BackendType` has been stored as a string since
 `controller_url` and an optional `provisioning_timeout_seconds`; the default is
 the server's generic ten minutes.
 
-Coverage is `src/tests/_internal/core/backends/sim/test_compute.py`, 18 cases:
+Coverage is `src/tests/_internal/core/backends/sim/test_compute.py`, 19 cases:
 offer conversion, the market filter, availability, no caching, `409` as no
 capacity, the provisioning-data lifecycle, presence and idempotent termination.
 It also asserts that only `DSTACK_SIM_ENABLED=1` registers the backend (unset,

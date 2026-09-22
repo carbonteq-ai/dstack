@@ -107,6 +107,14 @@ class TestGetOffers:
         offers = compute.get_offers(_requirements(spot=spot), False)
         assert {o.instance.name for o in offers} == names
 
+    def test_fields_the_controller_adds_are_ignored(self, compute):
+        with requests_mock.Mocker() as m:
+            m.get(f"{URL}/offers", json={"offers": [{**ON_DEMAND, "stock": 3, "new": "x"}]})
+            (offer,) = compute.get_offers(_requirements(), False)
+            m.get(f"{URL}/hosts/h1", json={"id": "h1", "status": "running", "faults": []})
+            assert compute.is_instance_present("h1", "sim-eu") is True
+        assert offer.instance.name == "sim-cpu"
+
     def test_an_unknown_availability_is_unknown_not_an_error(self, compute):
         with requests_mock.Mocker() as m:
             m.get(f"{URL}/offers", json={"offers": [{**ON_DEMAND, "availability": "odd"}]})
