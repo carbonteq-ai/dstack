@@ -128,6 +128,14 @@ try:
 except ImportError:
     pass
 
+# CARBONTEQ: raises ImportError unless DSTACK_SIM_ENABLED=1 (sim/configurator.py).
+try:
+    from dstack._internal.core.backends.sim.configurator import SimConfigurator
+
+    _CONFIGURATOR_CLASSES.append(SimConfigurator)
+except ImportError:
+    pass
+
 try:
     from dstack._internal.core.backends.slurm.configurator import SlurmConfigurator
 

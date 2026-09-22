@@ -26,6 +26,7 @@ class BackendType(str, enum.Enum):
         VERDA (BackendType): Verda Cloud
         VULTR (BackendType): Vultr
         SLURM (BackendType): Slurm
+        SIM (BackendType): the CarbonTeq simulator, only with DSTACK_SIM_ENABLED=1
     """
 
     AMDDEVCLOUD = "amddevcloud"
@@ -52,3 +53,5 @@ class BackendType(str, enum.Enum):
     VERDA = "verda"
     VULTR = "vultr"
     SLURM = "slurm"
+    # CARBONTEQ: the simulator backend (core/backends/sim, ADR-048).
+    SIM = "sim"
