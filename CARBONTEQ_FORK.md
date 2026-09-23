@@ -561,7 +561,15 @@ fetched again after `min_processing_interval`.
   `SUBMITTED` and not yet `instance_assigned`. Or it is `PENDING` with
   `resubmission_attempt > 0` and its latest master job ended
   `FAILED_TO_START_DUE_TO_NO_CAPACITY`. Waiters are taken from the job's project,
-  highest priority first, 50 fetched and at most 10 fit-checked.
+  highest priority first, then oldest first, with 50 candidates fetched.
+- **Fit before count** (control plane ADR-049 decision 2, SQ2, 2026-09-23).
+  Every waiting candidate is fit-checked in that order, and the first that fits
+  yields. The gate first kept 10 waiters and only then checked fit, so ten
+  higher `spot` waiters, which never fit an on-demand instance, hid an eleventh
+  on-demand waiter that did, and a lower run took its slot
+  (control plane `dstack-facts.md` §25c). The work is bounded by the 50-candidate
+  fetch and by stopping at the first fit. There is no separate cap on fit checks,
+  since any cap below the fetch would bring the defect back.
 - **Held runs never count.** A run held for a window or a schedule is `PENDING`
   with `resubmission_attempt == 0`, so a closed window cannot block the fleet.
 - **Fits** is dstack's own `get_instance_offers_from_instances` for the waiter's
@@ -590,7 +598,7 @@ The logic is an additive module,
 by one import and one call in `_select_assignment` in `jobs_submitted.py`.
 Coverage is `TestPriorityGate` in
 `src/tests/_internal/server/background/pipeline_tasks/test_submitted_jobs.py`,
-nine cases on SQLite and PostgreSQL:
+twelve cases on SQLite and PostgreSQL:
 
 - **Yields** to a submitted higher waiter that fits, and to a higher run
   retrying for capacity.
@@ -598,10 +606,18 @@ nine cases on SQLite and PostgreSQL:
   for a held higher run, at equal priority, past the retry window, without a
   no-capacity retry, and when the gate raises.
 - **A batch processed low first** yields the low job and places the high one.
+- **Fit before count.** `test_priority_gate_checks_fit_before_counting_waiters`
+  yields a low on-demand job to an eleventh higher waiter that fits behind ten
+  higher `spot` waiters that do not. It fails on the fit-after-count gate
+  (`bbde4c7`) on both databases.
+  `test_priority_gate_does_not_yield_to_a_higher_spot_run_beside_on_demand`
+  guards the market filter, and
+  `test_priority_gate_does_not_look_past_its_candidate_bound` shows a fitting
+  waiter beyond the candidate fetch is not seen. Both pass before and after.
 
-The three yield cases fail with the gate disabled. The whole
-`pipeline_tasks/` suite gives 470 passed with 460 PostgreSQL skips, and the
-submitted-jobs file fails nothing before or after.
+The three original yield cases fail with the gate disabled. The whole
+`pipeline_tasks/` suite gives 481 passed with 471 PostgreSQL skips, and the
+submitted-jobs file passes all 142 cases on SQLite and PostgreSQL.
 
 *Not covered.* Volumes are not part of the waiter's fit, so a waiter whose volume
 cannot attach to the instance still counts, bounded by the yielding run's window.
@@ -611,8 +627,9 @@ Fleets imported from another project are not searched for waiters.
 return shape. The gate needs existing-instance offers before any instance is
 locked. If upstream moves instance choice under the lock, the call has to move
 with it. Re-check `get_instance_offers_from_instances`' signature and the
-`instance_assigned` meaning. *Retire* it if upstream placement becomes
-priority-aware across concurrent workers and pending retries.
+`instance_assigned` meaning, and that its fit check still honours the spot
+requirement, which the fit-before-count tests rely on. *Retire* it if upstream
+placement becomes priority-aware across concurrent workers and pending retries.
 
 ### The sim backend
 

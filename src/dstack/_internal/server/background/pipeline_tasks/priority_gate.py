@@ -24,6 +24,12 @@ What it deliberately does not do:
 
 It is bounded by the yielding run's own no-capacity retry window, so a deferred job
 cannot wait forever, and it fails open: any error means no yield.
+
+**Fit before count** (control plane ADR-049, decision 2). The gate once kept the ten
+highest waiters and only then checked fit, so ten higher waiters that fit nothing, such
+as `spot` runs beside an on-demand instance, hid an eleventh that fitted, and a lower run
+took its slot. Every waiting candidate is now fit-checked in priority order and the first
+fit yields. The work is bounded by the candidate fetch, not by a count of waiters.
 """
 
 from datetime import datetime
@@ -51,10 +57,10 @@ from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# How many higher-priority waiters are fit-checked per placement, highest first. Each costs
-# an in-memory fit check against instances that are already loaded. More candidate runs
-# are fetched than checked, because a SUBMITTED run may already be provisioning.
-PRIORITY_GATE_MAX_WAITERS = 10
+# How many higher-priority candidate runs are fetched per placement, highest first. Every
+# one that is waiting is fit-checked, in memory against instances already loaded, until
+# the first fit. There is no separate cap on fit checks: any cap below this bound would let
+# waiters that fit nothing hide one that fits (ADR-049 decision 2).
 _PRIORITY_GATE_MAX_CANDIDATES = 50
 
 
@@ -136,8 +142,8 @@ async def _load_higher_priority_waiters(run_model: RunModel) -> list[RunModel]:
             .limit(_PRIORITY_GATE_MAX_CANDIDATES)
             .options(selectinload(RunModel.jobs))
         )
-        waiters = [r for r in res.scalars().all() if _latest_job_is_waiting(r) is not None]
-        return waiters[:PRIORITY_GATE_MAX_WAITERS]
+        # Not truncated: the caller fit-checks in this order and stops at the first fit.
+        return [r for r in res.scalars().all() if _latest_job_is_waiting(r) is not None]
 
 
 def _latest_job_is_waiting(run_model: RunModel) -> Optional[JobModel]:
