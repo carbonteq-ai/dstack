@@ -292,12 +292,29 @@ unassigned (`jobs_terminating.py`), so there is no new column and no migration.
 The run pipeline already re-examines retrying runs every ten seconds, so a
 release is noticed within one fetch interval.
 
+**The wake is scoped to the market** (control plane ADR-049 decision 3,
+dstack-facts §25d, 2026-09-23). A released instance wakes a waiter only if the
+instance's offer matches the waiter's spot requirement — the test
+`requirements_to_query_filter` applies to offers (`q.spot = req.spot`), done in
+memory. The requirement is `JobSpec.requirements.spot` of the attempt's
+no-capacity jobs; the market is `instance.resources.spot` of the instance's
+stored offer (`get_instance_offer`). A spot waiter is woken only by a spot
+instance, an on-demand waiter only by an on-demand one, an `auto` waiter by
+either. Before this, a released on-demand instance woke every spot waiter too,
+and each spent an attempt — on a cloud fleet, a placeholder — on capacity every
+fit check refuses it. The other conditions stay in SQL; for a waiter with a
+market requirement the query reads the latest 50 releases
+(`_WAKE_CANDIDATE_LIMIT`, newest `last_job_processed_at` first) instead of one,
+and an `auto` waiter still reads one row. It fails open: an instance with no
+offer or one that does not parse counts as a release, and a job spec that does
+not parse counts as `auto`.
+
 The anchor is `JobModel.submitted_at`, not `last_processed_at`. An attempt can
 find no capacity, the slot can free a second later, and the attempt's job is
 only marked failed after that — measured, not hypothetical. Anchoring on the
 failure misses exactly that release.
 
-It is deliberately loose. Fit is not checked, so a wake can be wasted: at most
+Beyond the market it is deliberately loose. Fit is not checked, so a wake can be wasted: at most
 one attempt per waiter per release, because the woken attempt's own
 `submitted_at` postdates the release. Every waiter in the project is woken, not
 only the highest priority. Placement decides who gets the slot, which today is
@@ -306,24 +323,41 @@ a race (control plane S-29, ADR-046). Other retry events — `error`,
 
 Touches `server/background/pipeline_tasks/runs/pending.py` (a new
 `capacity_released_since_last_attempt`, a `PendingContext.capacity_released`
-field and one condition in `process_pending_run`) and two lines in
+field and one condition in `process_pending_run`, plus the market helpers
+`_spot_requirement` and `_released_into`) and two lines in
 `runs/__init__.py`'s `_load_pending_context`. Coverage is `TestWakeOnRelease` in
 `src/tests/_internal/server/background/pipeline_tasks/test_runs/test_pending.py`,
-eight cases on SQLite and PostgreSQL: a release wakes the run, including one
+sixteen cases on SQLite and PostgreSQL: a release wakes the run, including one
 that happened while the attempt was being failed, and a freed block on a
 shared instance; a release before the attempt, an instance with no free block,
 another project's instance, an unreachable or terminating instance, and a
 non-capacity failure do not. The three positive cases fail against `1c03109`,
 and all three fail if the anchor is changed to `last_processed_at`.
 
+The market cases: `..._ignores_an_on_demand_release_for_a_spot_waiter` and
+`..._ignores_a_spot_release_for_an_on_demand_waiter` fail against `101c806`
+(the run is resubmitted); `..._wakes_a_waiter_in_the_same_market` (spot→spot,
+on-demand→on-demand, `auto` woken by either), `..._finds_a_same_market_release_beside_another_market`
+(three newer other-market releases ahead of one match; fails if the bound is
+one row) and `..._fails_open_on_an_instance_without_an_offer` pass on both.
+
 *Not covered.* A newly added instance that has never run a job has no
 `last_job_processed_at` and wakes nobody; its waiters keep their timers. Nor
-does a fleet imported from another project.
+does a fleet imported from another project. Nor does any instance whose
+provisioning data is not `dockerized` — RunPod, Vast.ai, Kubernetes, Slurm and
+the sim backend: `jobs_terminating.py` moves it to `TERMINATING` in the same
+update that stamps `last_job_processed_at`, so it is never `IDLE` or `BUSY`
+with a release to report. More than 50 other-market releases since one attempt
+began also fall back to the backoff.
 
 *Rebase.* `process_pending_run`'s readiness condition and `_load_pending_context`
 are small, but they sit in a hot pipeline beside the jittered backoff. Check that
 `last_job_processed_at` is still written only on unassignment; if upstream starts
-writing it on assignment, every waiter would wake on every placement. *Retire*
+writing it on assignment, every waiter would wake on every placement. Check that
+`Requirements.spot` is still the tri-state `requirements_to_query_filter` copies
+onto the offer query, and that the offer still carries `instance.resources.spot`;
+if placement stops honouring the spot requirement, drop the market scoping with
+it. *Retire*
 it if upstream wakes capacity waiters on release, or if the backoff stops
 applying to `no-capacity` retries.
 
