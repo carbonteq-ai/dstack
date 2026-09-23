@@ -614,6 +614,74 @@ with it. Re-check `get_instance_offers_from_instances`' signature and the
 `instance_assigned` meaning. *Retire* it if upstream placement becomes
 priority-aware across concurrent workers and pending retries.
 
+### The sim backend
+
+Control plane ADR-048 (proposed; accepted by its task `G1` on spike `SB1`),
+2026-09-23. The control plane needs dstack's own placement, retry and
+interruption code to run with no cloud, so the same scenarios can run on a
+simulator and then on real hardware. Upstream has no local or mock backend,
+and its server reaches every runner through an OpenSSH tunnel with no bypass.
+So the simulator is a backend here, and its hosts are containers running a real
+sshd in front of a fake runner.
+
+`sim` is a container backend shaped exactly like RunPod. `run_job` asks an
+external **sim controller** for a host and returns provisioning data with no
+hostname; `update_provisioning_data` fills the address in once the controller
+reports the host running, and raises `ProvisioningError` if it failed or
+vanished; `is_instance_present` is whether the controller still knows the host,
+so a spot interruption is confirmed at once, as this fork already does for
+RunPod; `terminate_instance` deletes it and treats a 404 as done. `get_offers`
+reads the controller's catalogue on every call, with no offer cache, because
+stock and faults change between scenarios. It converts each entry through
+gpuhunt's `CatalogItem` and `catalog_item_to_offer` and filters with
+`filter_offers_by_requirements`, so the market, GPU, CPU and price filter is the
+one every gpuhunt backend uses. The sim has no filter of its own. A controller
+`409` from `POST /hosts` is `NoCapacityError`.
+
+The controller, its catalogue, the host image and every fault live in the
+control-plane repository (`sim/`), not here. This package is deliberately a thin
+HTTP client (`core/backends/sim/client.py`, whose docstring is the wire format),
+so the simulator can grow without new fork deltas. It parses the controller's
+responses with `__response__`, which ignores unknown fields, because a strict
+parse would turn every field the controller adds into a failed run.
+
+**It never loads by accident.** `core/backends/sim/configurator.py` raises
+`ImportError` unless `DSTACK_SIM_ENABLED=1`, and `configurators.py` imports every
+configurator inside `try/except ImportError`, so on any other server the
+backend is simply unavailable. A config naming `type: sim` still parses,
+because the models are plain data, and is then refused as a backend the server
+does not have. The control plane's `harness/checks/sim-isolation.sh` fails if
+either Dokploy compose names the variable or the sim image.
+
+The delta:
+
+- adds the package `src/dstack/_internal/core/backends/sim/` (`models.py`,
+  `client.py`, `compute.py`, `backend.py`, `configurator.py`);
+- adds `SIM = "sim"` to `BackendType` in
+  `src/dstack/_internal/core/models/backends/base.py`;
+- adds one `try`-import block to `src/dstack/_internal/core/backends/configurators.py`;
+- adds `SimBackendConfig` / `SimBackendConfigWithCreds` to the three config unions in
+  `src/dstack/_internal/core/backends/models.py`.
+
+No migration: `BackendType` has been stored as a string since
+`bc8ca4a505c6_store_backendtype_as_string`. The config has no credentials, only
+`controller_url` and an optional `provisioning_timeout_seconds`; the default is
+the server's generic ten minutes.
+
+Coverage is `src/tests/_internal/core/backends/sim/test_compute.py`, 19 cases:
+offer conversion, the market filter, availability, no caching, `409` as no
+capacity, the provisioning-data lifecycle, presence and idempotent termination.
+It also asserts that only `DSTACK_SIM_ENABLED=1` registers the backend (unset,
+`0` and `true` do not). End to end, the control plane's `sim/smoke.sh` takes a
+task from `submitted` to `done` through the unchanged SSH tunnel and runner
+protocol, with `run.cost` equal to the catalogue price times the duration.
+
+*Rebase.* Additive, so the surface is small. Re-check the three upstream edits,
+the abstract `Compute` surface (`get_offers`, `run_job`, `terminate_instance`,
+and this fork's `is_instance_present`), `catalog_item_to_offer`'s signature, and
+`JobProvisioningData`'s fields. *Retire* it when the control plane stops needing
+a simulator (ADR-048's reversal): delete the package and the three edits.
+
 ## Fixed: version.sh described the wrong repository
 
 `version.sh` exists so a release version cannot be forgotten. Both of its
@@ -983,6 +1051,9 @@ add the new key beside it — currently four sites in
 
 Retire the deferred start if upstream gains a one-shot start time of its own, or
 if compute windows stop being a requirement.
+
+The sim backend is a fourth unit, and additive: its rebase and retirement
+conditions are in its own section above.
 
 Because the plugin hook is upstream-experimental, also re-check
 `ApplyPolicy.on_run_apply`'s signature on every rebase.

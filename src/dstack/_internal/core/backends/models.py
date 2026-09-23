@@ -66,6 +66,12 @@ from dstack._internal.core.backends.runpod.models import (
     RunpodBackendConfig,
     RunpodBackendConfigWithCreds,
 )
+
+# CARBONTEQ: the simulator backend (ADR-048).
+from dstack._internal.core.backends.sim.models import (
+    SimBackendConfig,
+    SimBackendConfigWithCreds,
+)
 from dstack._internal.core.backends.slurm.models import (
     SlurmBackendConfig,
     SlurmBackendConfigWithCreds,
@@ -110,6 +116,7 @@ AnyBackendConfigWithoutCreds = Union[
     VerdaBackendConfig,
     VultrBackendConfig,
     SlurmBackendConfig,
+    SimBackendConfig,
     DstackBackendConfig,
     DstackBaseBackendConfig,
 ]
@@ -137,6 +144,7 @@ AnyBackendConfigWithCreds = Union[
     VastAIBackendConfigWithCreds,
     VultrBackendConfigWithCreds,
     SlurmBackendConfigWithCreds,
+    SimBackendConfigWithCreds,
     DstackBackendConfig,
 ]
 
@@ -163,6 +171,7 @@ AnyBackendFileConfigWithCreds = Union[
     VastAIBackendConfigWithCreds,
     VultrBackendConfigWithCreds,
     SlurmBackendFileConfigWithCreds,
+    SimBackendConfigWithCreds,
 ]
 
 
