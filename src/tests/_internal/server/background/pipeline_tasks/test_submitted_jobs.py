@@ -3349,8 +3349,11 @@ class TestPriorityGate:
         resources: ResourcesSpec | None = None,
         resubmission_attempt: int = 0,
         next_triggered_at=None,
+        spot: bool = False,
     ):
         profile = Profile(name="default")
+        if spot:
+            profile.spot_policy = SpotPolicy.SPOT
         if retry:
             profile.retry = ProfileRetry(on_events=[RetryEvent.NO_CAPACITY], duration=3600)
         configuration = DevEnvironmentConfiguration(ide="vscode")
@@ -3547,3 +3550,61 @@ class TestPriorityGate:
 
         await self._assert_yielded(session, low_job)
         await self._assert_placed(session, high_job, instance)
+
+    async def test_priority_gate_does_not_yield_to_a_higher_spot_run_beside_on_demand(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        # The fit check honours the market: a spot run never fits an on-demand instance.
+        project, user, repo, _, instance = await self._setup(session)
+        low = await self._run(session, project, user, repo, "low", 29)
+        low_job = await create_job(session=session, run=low)
+        high = await self._run(session, project, user, repo, "high-spot", 99, spot=True)
+        await create_job(session=session, run=high)
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+
+        await self._assert_placed(session, low_job, instance)
+
+    async def test_priority_gate_checks_fit_before_counting_waiters(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        # ADR-049 coupling 1: ten higher spot waiters that cannot fit the on-demand instance
+        # must not hide an eleventh higher waiter, on-demand, that does.
+        project, user, repo, _, _ = await self._setup(session)
+        low = await self._run(session, project, user, repo, "low", 29)
+        low_job = await create_job(session=session, run=low)
+        for i in range(10):
+            spot = await self._run(session, project, user, repo, f"spot-{i}", 99, spot=True)
+            await create_job(session=session, run=spot)
+        on_demand = await self._run(session, project, user, repo, "on-demand", 50)
+        await create_job(session=session, run=on_demand)
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+
+        await self._assert_yielded(session, low_job)
+
+    async def test_priority_gate_does_not_look_past_its_candidate_bound(
+        self,
+        test_db,
+        session: AsyncSession,
+        worker: JobSubmittedWorker,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        # The work stays bounded: a fitting waiter beyond the candidate limit is not seen.
+        monkeypatch.setattr(
+            "dstack._internal.server.background.pipeline_tasks.priority_gate"
+            "._PRIORITY_GATE_MAX_CANDIDATES",
+            3,
+        )
+        project, user, repo, _, instance = await self._setup(session)
+        low = await self._run(session, project, user, repo, "low", 29)
+        low_job = await create_job(session=session, run=low)
+        for i in range(3):
+            spot = await self._run(session, project, user, repo, f"spot-{i}", 99, spot=True)
+            await create_job(session=session, run=spot)
+        on_demand = await self._run(session, project, user, repo, "on-demand", 50)
+        await create_job(session=session, run=on_demand)
+
+        await _process_job(session=session, worker=worker, job_model=low_job)
+
+        await self._assert_placed(session, low_job, instance)
