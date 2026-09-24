@@ -7,6 +7,7 @@ from typing import Optional
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from dstack._internal.core.models.configurations import ServiceConfiguration
 from dstack._internal.core.models.instances import InstanceStatus
@@ -18,6 +19,8 @@ from dstack._internal.server.background.pipeline_tasks.runs.common import (
     compute_desired_replica_counts,
 )
 from dstack._internal.server.models import InstanceModel, JobModel, RunModel
+from dstack._internal.server.services.instances import get_instance_offer
+from dstack._internal.server.services.jobs import get_job_spec
 from dstack._internal.utils.common import get_current_datetime
 from dstack._internal.utils.logging import get_logger
 
@@ -154,20 +157,33 @@ async def capacity_released_since_last_attempt(session: AsyncSession, run_model:
     can find no capacity, the slot can free a second later, and the attempt's job is only
     marked failed after that. Anchoring on the failure would miss that release.
 
-    Deliberately loose: whether the run fits the freed instance is not checked here, so a
-    wake can be wasted. That costs one attempt per waiter per release, since the woken
-    attempt's own `submitted_at` postdates the release. Placement decides the fit.
+    Scoped to the market (ADR-049 decision 3): the freed instance must match the waiter's
+    spot requirement, the same test `requirements_to_query_filter` applies to offers
+    (`q.spot = req.spot`). A spot waiter is woken only by a spot instance, an on-demand
+    waiter only by an on-demand one, and an `auto` waiter by either. Placement honours that
+    requirement, so a release in the other market is capacity the waiter can never use;
+    waking it anyway spent an attempt, and on a cloud fleet a placeholder, per waiter per
+    release. An instance whose offer cannot be read counts as a release, as it did before
+    the scoping: this delta fails open.
+
+    Otherwise deliberately loose: whether the run fits the freed instance is not checked
+    here, so a wake can be wasted. That costs one attempt per waiter per release, since the
+    woken attempt's own `submitted_at` postdates the release. Placement decides the fit.
     """
     if run_model.resubmission_attempt <= 0 or not run_model.jobs:
         return False
-    if not any(
-        job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+    waiting_jobs = [
+        job
         for job in run_model.jobs
-    ):
+        if job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+    ]
+    if not waiting_jobs:
         return False
+    markets = {_spot_requirement(job) for job in waiting_jobs}
     last_attempt_at = max(job.submitted_at for job in run_model.jobs)
     res = await session.execute(
-        select(InstanceModel.id)
+        select(InstanceModel)
+        .options(load_only(InstanceModel.id, InstanceModel.offer))
         .where(
             InstanceModel.project_id == run_model.project_id,
             InstanceModel.deleted == False,
@@ -182,9 +198,42 @@ async def capacity_released_since_last_attempt(session: AsyncSession, run_model:
                 ),
             ),
         )
-        .limit(1)
+        .order_by(InstanceModel.last_job_processed_at.desc())
+        # Any release wakes an `auto` waiter, so one row answers; otherwise the market is
+        # read from each offer in memory, over a bounded number of the latest releases.
+        .limit(1 if None in markets else _WAKE_CANDIDATE_LIMIT)
     )
-    return res.scalar_one_or_none() is not None
+    return any(_released_into(instance, markets) for instance in res.scalars().all())
+
+
+# CarbonTeq (ADR-049 decision 3): how many of the latest releases a waiter with a market
+# requirement inspects. A project with more releases than this since one attempt began,
+# all in the other market, delays the wake to the backoff step, as before D-49.
+_WAKE_CANDIDATE_LIMIT = 50
+
+
+def _spot_requirement(job_model: JobModel) -> Optional[bool]:
+    """The job's `requirements.spot`: True spot, False on-demand, None either (`auto`).
+    A spec that cannot be read is treated as `auto`, so it never silences a wake."""
+    try:
+        return get_job_spec(job_model).requirements.spot
+    except Exception:
+        logger.warning("Cannot read the spot requirement of job %s", job_model.id)
+        return None
+
+
+def _released_into(instance_model: InstanceModel, markets: set[Optional[bool]]) -> bool:
+    """Whether a release on this instance is capacity for a waiter requiring `markets`."""
+    if None in markets:
+        return True
+    try:
+        offer = get_instance_offer(instance_model)
+    except Exception:
+        logger.warning("Cannot read the offer of instance %s", instance_model.id)
+        return True
+    if offer is None:
+        return True
+    return offer.instance.resources.spot in markets
 
 
 # We use exponentially increasing retry delays for pending runs.

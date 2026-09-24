@@ -1,6 +1,7 @@
 import json
 import uuid
 from datetime import timedelta
+from typing import Optional
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dstack._internal.core.models.configurations import ScalingSpec, ServiceConfiguration
 from dstack._internal.core.models.instances import InstanceStatus
+from dstack._internal.core.models.profiles import Profile, SpotPolicy
 from dstack._internal.core.models.resources import Range
 from dstack._internal.core.models.runs import (
     JobStatus,
@@ -390,10 +392,16 @@ class TestWakeOnRelease:
         termination_reason: JobTerminationReason = (
             JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
         ),
+        spot_policy: Optional[SpotPolicy] = None,
     ):
         project = await create_project(session=session)
         user = await create_user(session=session)
         repo = await create_repo(session=session, project_id=project.id)
+        # A dev environment with no spot policy requires on-demand, as the default
+        # instance is, so the cases that do not name a market release into the same one.
+        run_spec = get_run_spec(
+            repo_id=repo.name, profile=Profile(name="default", spot_policy=spot_policy)
+        )
         # Attempt 5 is the five-minute step, so only a wake can resubmit it within the test.
         run = await create_run(
             session=session,
@@ -402,6 +410,7 @@ class TestWakeOnRelease:
             user=user,
             status=RunStatus.PENDING,
             resubmission_attempt=5,
+            run_spec=run_spec,
         )
         now = get_current_datetime()
         await create_job(
@@ -539,6 +548,89 @@ class TestWakeOnRelease:
         await self._process(session, worker, run)
 
         assert run.status == RunStatus.PENDING
+
+    # ADR-049 decision 3: the wake is scoped to the market. Placement honours the run's
+    # spot requirement, so a release in the other market is capacity the waiter can never
+    # use, and waking it spends an attempt (and on a cloud fleet a placeholder) for nothing.
+
+    async def test_wake_on_release_ignores_an_on_demand_release_for_a_spot_waiter(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        project, run = await self._waiting_run(session, spot_policy=SpotPolicy.SPOT)
+        instance = await create_instance(session=session, project=project, spot=False)
+        instance.last_job_processed_at = get_current_datetime() - timedelta(seconds=5)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.PENDING
+
+    async def test_wake_on_release_ignores_a_spot_release_for_an_on_demand_waiter(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        project, run = await self._waiting_run(session, spot_policy=SpotPolicy.ONDEMAND)
+        instance = await create_instance(session=session, project=project, spot=True)
+        instance.last_job_processed_at = get_current_datetime() - timedelta(seconds=5)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.PENDING
+
+    @pytest.mark.parametrize(
+        ("spot_policy", "instance_spot"),
+        [
+            (SpotPolicy.SPOT, True),
+            (SpotPolicy.ONDEMAND, False),
+            (SpotPolicy.AUTO, True),
+            (SpotPolicy.AUTO, False),
+        ],
+    )
+    async def test_wake_on_release_wakes_a_waiter_in_the_same_market(
+        self,
+        test_db,
+        session: AsyncSession,
+        worker: RunWorker,
+        spot_policy: SpotPolicy,
+        instance_spot: bool,
+    ) -> None:
+        # `auto` competes for both markets, so a release in either wakes it.
+        project, run = await self._waiting_run(session, spot_policy=spot_policy)
+        instance = await create_instance(session=session, project=project, spot=instance_spot)
+        instance.last_job_processed_at = get_current_datetime() - timedelta(seconds=5)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.SUBMITTED
+
+    async def test_wake_on_release_finds_a_same_market_release_beside_another_market(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        # The market is read after the query, so the query must not stop at the first
+        # release it finds: here the three latest releases are in the other market.
+        project, run = await self._waiting_run(session, spot_policy=SpotPolicy.SPOT)
+        released = get_current_datetime() - timedelta(seconds=5)
+        for i in range(3):
+            on_demand = await create_instance(
+                session=session, project=project, spot=False, name=f"on-demand-{i}"
+            )
+            on_demand.last_job_processed_at = released
+        spot = await create_instance(session=session, project=project, spot=True, name="spot")
+        spot.last_job_processed_at = released - timedelta(seconds=1)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.SUBMITTED
+
+    async def test_wake_on_release_fails_open_on_an_instance_without_an_offer(
+        self, test_db, session: AsyncSession, worker: RunWorker
+    ) -> None:
+        # No market to read is not evidence of the wrong market: wake, as before the scoping.
+        project, run = await self._waiting_run(session, spot_policy=SpotPolicy.SPOT)
+        instance = await create_instance(session=session, project=project, offer=None)
+        instance.last_job_processed_at = get_current_datetime() - timedelta(seconds=5)
+
+        await self._process(session, worker, run)
+
+        assert run.status == RunStatus.SUBMITTED
 
 
 def test_retry_backoff_has_stable_twenty_percent_jitter_and_ten_minute_base_cap() -> None:
